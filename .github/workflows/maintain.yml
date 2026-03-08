@@ -1,0 +1,43 @@
+name: Scheduled Maintenance
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: web
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install aiohttp rich requests
+
+      - name: Run maintenance scan
+        id: scan
+        env:
+          CPA_INSTANCES: ${{ secrets.CPA_INSTANCES }}
+        run: python3 .github/scripts/scheduled_maintain.py
+
+      - name: Send Feishu notification
+        if: always()
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          SCAN_RESULT: ${{ steps.scan.outputs.result }}
+          SCAN_STATUS: ${{ steps.scan.outcome }}
+        run: python3 .github/scripts/feishu_notify.py
