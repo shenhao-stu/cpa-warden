@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CPA Warden</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Connection Screen -->
+    <div id="connect-screen" class="screen active">
+      <div class="connect-card">
+        <div class="logo">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="48" height="48" rx="12" fill="var(--accent)"/>
+            <path d="M24 12L14 18v12l10 6 10-6V18L24 12z" stroke="#fff" stroke-width="2" fill="none"/>
+            <path d="M24 18v12M18 21l6 3 6-3" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <h1>CPA Warden</h1>
+        <p class="subtitle">Auth inventory management for CLIProxyAPI</p>
+
+        <div id="saved-connections" class="saved-connections" style="display:none">
+          <label>Saved Connections</label>
+          <div id="saved-list" class="saved-list"></div>
+        </div>
+
+        <form id="connect-form" autocomplete="off">
+          <div class="form-group">
+            <label for="base-url">Base URL</label>
+            <input type="url" id="base-url" placeholder="https://your-cpa.example.com" required>
+          </div>
+          <div class="form-group">
+            <label for="token">Management Token</label>
+            <div class="input-password">
+              <input type="password" id="token" placeholder="Enter management token" required>
+              <button type="button" class="btn-icon" id="toggle-password" aria-label="Toggle password visibility">
+                <svg class="icon-eye" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                <svg class="icon-eye-off" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="form-check">
+            <input type="checkbox" id="remember" checked>
+            <label for="remember">Remember this connection</label>
+          </div>
+          <button type="submit" class="btn btn-primary btn-full" id="connect-btn">
+            <span class="btn-text">Connect</span>
+            <span class="btn-loading" style="display:none">
+              <span class="spinner"></span> Connecting...
+            </span>
+          </button>
+        </form>
+        <p class="footer-note">Credentials are stored locally in your browser only.</p>
+      </div>
+    </div>
+
+    <!-- Dashboard Screen -->
+    <div id="dashboard-screen" class="screen">
+      <header class="topbar">
+        <div class="topbar-left">
+          <svg width="28" height="28" viewBox="0 0 48 48" fill="none">
+            <rect width="48" height="48" rx="12" fill="var(--accent)"/>
+            <path d="M24 12L14 18v12l10 6 10-6V18L24 12z" stroke="#fff" stroke-width="2" fill="none"/>
+            <path d="M24 18v12M18 21l6 3 6-3" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/>
+          </svg>
+          <span class="topbar-title">CPA Warden</span>
+          <span class="topbar-url" id="topbar-url"></span>
+        </div>
+        <div class="topbar-right">
+          <button class="btn btn-ghost btn-sm" id="theme-toggle" aria-label="Toggle theme">
+            <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+            <svg class="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+          </button>
+          <button class="btn btn-ghost btn-sm" id="refresh-btn" aria-label="Refresh">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+          </button>
+          <button class="btn btn-ghost btn-sm" id="disconnect-btn">Disconnect</button>
+        </div>
+      </header>
+
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="overview" role="tab">Overview</button>
+        <button class="tab" data-tab="accounts" role="tab">Accounts</button>
+        <button class="tab" data-tab="upload" role="tab">Upload</button>
+        <button class="tab" data-tab="oauth" role="tab">OAuth Login</button>
+        <button class="tab" data-tab="settings" role="tab">Settings</button>
+      </nav>
+
+      <main class="content">
+        <!-- Overview Tab -->
+        <section id="tab-overview" class="tab-panel active">
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-value" id="stat-total">-</div>
+              <div class="stat-label">Total Accounts</div>
+            </div>
+            <div class="stat-card stat-active">
+              <div class="stat-value" id="stat-active">-</div>
+              <div class="stat-label">Active</div>
+            </div>
+            <div class="stat-card stat-disabled">
+              <div class="stat-value" id="stat-disabled">-</div>
+              <div class="stat-label">Disabled</div>
+            </div>
+            <div class="stat-card stat-unavailable">
+              <div class="stat-value" id="stat-unavailable">-</div>
+              <div class="stat-label">Unavailable</div>
+            </div>
+          </div>
+
+          <div class="card-row">
+            <div class="card flex-2">
+              <h3>Accounts by Type</h3>
+              <div id="chart-types" class="chart-container"></div>
+            </div>
+            <div class="card flex-1">
+              <h3>Status Breakdown</h3>
+              <div id="chart-status" class="chart-container"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Accounts by Provider</h3>
+            <div id="chart-providers" class="chart-container"></div>
+          </div>
+
+          <div class="card">
+            <h3>Recent Activity</h3>
+            <div id="recent-activity" class="activity-list">
+              <p class="placeholder">Loading...</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- Accounts Tab -->
+        <section id="tab-accounts" class="tab-panel">
+          <div class="toolbar">
+            <div class="toolbar-left">
+              <div class="search-box">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                <input type="text" id="search-input" placeholder="Search accounts...">
+              </div>
+              <select id="filter-type" class="select">
+                <option value="">All Types</option>
+              </select>
+              <select id="filter-provider" class="select">
+                <option value="">All Providers</option>
+              </select>
+              <select id="filter-status" class="select">
+                <option value="">All Statuses</option>
+              </select>
+            </div>
+            <div class="toolbar-right">
+              <span id="account-count" class="text-muted"></span>
+              <button class="btn btn-ghost btn-sm" id="select-all-btn">Select All</button>
+              <button class="btn btn-danger btn-sm" id="bulk-delete-btn" style="display:none">Delete Selected</button>
+              <button class="btn btn-warning btn-sm" id="bulk-disable-btn" style="display:none">Disable Selected</button>
+              <button class="btn btn-success btn-sm" id="bulk-enable-btn" style="display:none">Enable Selected</button>
+            </div>
+          </div>
+          <div class="table-wrapper">
+            <table class="table" id="accounts-table">
+              <thead>
+                <tr>
+                  <th class="th-check"><input type="checkbox" id="check-all"></th>
+                  <th class="sortable" data-sort="name">Name</th>
+                  <th class="sortable" data-sort="email">Email</th>
+                  <th class="sortable" data-sort="type">Type</th>
+                  <th class="sortable" data-sort="provider">Provider</th>
+                  <th class="sortable" data-sort="status">Status</th>
+                  <th class="sortable" data-sort="account_type">Account</th>
+                  <th class="sortable" data-sort="updated_at">Updated</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="accounts-body">
+              </tbody>
+            </table>
+          </div>
+          <div class="pagination" id="pagination"></div>
+        </section>
+
+        <!-- Upload Tab -->
+        <section id="tab-upload" class="tab-panel">
+          <div class="card upload-card">
+            <h3>Upload Auth Files</h3>
+            <p class="text-muted">Upload JSON credential files to the CPA instance. Files are immediately registered into the runtime auth manager.</p>
+            <div class="dropzone" id="dropzone">
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <p>Drag and drop JSON files here, or <label for="file-input" class="link">browse</label></p>
+              <input type="file" id="file-input" accept=".json" multiple hidden>
+            </div>
+            <div id="upload-queue" class="upload-queue"></div>
+          </div>
+        </section>
+
+        <!-- OAuth Tab -->
+        <section id="tab-oauth" class="tab-panel">
+          <div class="card">
+            <h3>OAuth Login</h3>
+            <p class="text-muted">Initiate OAuth login flows to add new accounts. A browser window will open for authentication.</p>
+            <div class="oauth-grid">
+              <button class="oauth-btn" data-provider="codex">
+                <div class="oauth-icon codex">C</div>
+                <div>
+                  <div class="oauth-name">OpenAI Codex</div>
+                  <div class="oauth-desc">Add Codex account via OAuth</div>
+                </div>
+              </button>
+              <button class="oauth-btn" data-provider="anthropic">
+                <div class="oauth-icon anthropic">A</div>
+                <div>
+                  <div class="oauth-name">Anthropic Claude</div>
+                  <div class="oauth-desc">Add Claude account via OAuth</div>
+                </div>
+              </button>
+              <button class="oauth-btn" data-provider="gemini-cli">
+                <div class="oauth-icon gemini">G</div>
+                <div>
+                  <div class="oauth-name">Gemini CLI</div>
+                  <div class="oauth-desc">Add Gemini account via OAuth</div>
+                </div>
+              </button>
+              <button class="oauth-btn" data-provider="qwen">
+                <div class="oauth-icon qwen">Q</div>
+                <div>
+                  <div class="oauth-name">Qwen</div>
+                  <div class="oauth-desc">Add Qwen account via device auth</div>
+                </div>
+              </button>
+              <button class="oauth-btn" data-provider="iflow">
+                <div class="oauth-icon iflow">I</div>
+                <div>
+                  <div class="oauth-name">iFlow</div>
+                  <div class="oauth-desc">Add iFlow account via OAuth</div>
+                </div>
+              </button>
+              <button class="oauth-btn" data-provider="antigravity">
+                <div class="oauth-icon antigravity">AG</div>
+                <div>
+                  <div class="oauth-name">Antigravity</div>
+                  <div class="oauth-desc">Add Antigravity account</div>
+                </div>
+              </button>
+            </div>
+          </div>
+          <div id="oauth-status" class="card" style="display:none">
+            <h3>OAuth Status</h3>
+            <div id="oauth-status-content"></div>
+          </div>
+        </section>
+
+        <!-- Settings Tab -->
+        <section id="tab-settings" class="tab-panel">
+          <div class="card">
+            <h3>CPA Configuration</h3>
+            <p class="text-muted">View and modify the remote CPA instance configuration.</p>
+            <div id="config-loading" class="placeholder">Loading configuration...</div>
+            <div id="config-editor" style="display:none">
+              <textarea id="config-yaml" class="code-editor" rows="20" spellcheck="false"></textarea>
+              <div class="form-actions">
+                <button class="btn btn-primary" id="save-config-btn">Save Configuration</button>
+                <button class="btn btn-ghost" id="reload-config-btn">Reload</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>API Keys</h3>
+            <p class="text-muted">Manage API keys for the CPA instance.</p>
+            <div id="api-keys-content">
+              <div class="placeholder">Loading...</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Usage Statistics</h3>
+            <div class="form-actions">
+              <button class="btn btn-ghost" id="export-usage-btn">Export Usage Data</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Logs</h3>
+            <div class="form-actions">
+              <button class="btn btn-ghost" id="view-logs-btn">View Logs</button>
+              <button class="btn btn-danger btn-sm" id="clear-logs-btn">Clear Logs</button>
+            </div>
+            <div id="logs-content" style="display:none">
+              <pre class="log-viewer" id="log-viewer"></pre>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Modal -->
+    <div class="modal-overlay" id="modal-overlay">
+      <div class="modal" id="modal">
+        <div class="modal-header">
+          <h3 id="modal-title"></h3>
+          <button class="btn-icon modal-close" id="modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-footer" id="modal-footer"></div>
+      </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="toast-container"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
