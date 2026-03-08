@@ -144,26 +144,22 @@
         <!-- Accounts Tab -->
         <section id="tab-accounts" class="tab-panel">
           <div class="toolbar">
-            <div class="toolbar-left">
-              <div class="search-box">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                <input type="text" id="search-input" placeholder="搜索账号...">
+            <div class="toolbar-search">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <input type="text" id="search-input" placeholder="搜索账号...">
+              <div class="toolbar-filters">
+                <select id="filter-type" class="filter-select"><option value="">类型 ▾</option></select>
+                <select id="filter-provider" class="filter-select"><option value="">提供商 ▾</option></select>
+                <select id="filter-status" class="filter-select">
+                  <option value="">状态 ▾</option>
+                  <option value="active">活跃</option>
+                  <option value="disabled">已禁用</option>
+                  <option value="unavailable">不可用</option>
+                </select>
               </div>
-              <select id="filter-type" class="select">
-                <option value="">全部类型</option>
-              </select>
-              <select id="filter-provider" class="select">
-                <option value="">全部提供商</option>
-              </select>
-              <select id="filter-status" class="select">
-                <option value="">全部状态</option>
-                <option value="active">活跃</option>
-                <option value="disabled">已禁用</option>
-                <option value="unavailable">不可用</option>
-              </select>
             </div>
-            <div class="toolbar-right">
-              <span id="account-count" class="text-muted"></span>
+            <div class="toolbar-actions">
+              <span id="account-count" class="toolbar-count"></span>
               <button class="btn btn-ghost btn-sm" data-action="select-all">全选</button>
               <button class="btn btn-danger btn-sm" data-action="bulk-delete" style="display:none">删除选中</button>
               <button class="btn btn-warning btn-sm" data-action="bulk-disable" style="display:none">禁用选中</button>

@@ -501,8 +501,8 @@
   }
 
   function populateFilterDropdowns() {
-    populateSelect('#filter-type', uniqueValues(state.files, 'type'), '\u5168\u90E8\u7C7B\u578B');
-    populateSelect('#filter-provider', uniqueValues(state.files, 'provider'), '\u5168\u90E8\u63D0\u4F9B\u5546');
+    populateSelect('#filter-type', uniqueValues(state.files, 'type'), '\u7C7B\u578B');
+    populateSelect('#filter-provider', uniqueValues(state.files, 'provider'), '\u63D0\u4F9B\u5546');
   }
 
   function populateSelect(sel, values, placeholder) {
