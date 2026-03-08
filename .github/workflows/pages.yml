@@ -3,7 +3,6 @@ name: Deploy Web UI to GitHub Pages
 on:
   push:
     branches: [web]
-    paths: [web/**]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +23,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          ref: web
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
