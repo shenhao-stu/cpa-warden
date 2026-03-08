@@ -196,13 +196,107 @@ Default output artifacts:
 - `--debug` or `debug: true` enables more verbose terminal logging
 - The log file always keeps full debug-level details
 
+## Web UI
+
+The `web` branch includes a browser-based dashboard for managing CPA auth files. It is a pure HTML/CSS/JS application with no build step — deployable to GitHub Pages or any static hosting service.
+
+Features:
+
+- Overview dashboard with account statistics and visual charts
+- Searchable, sortable, paginated accounts table with bulk actions
+- Upload, download, and delete auth files
+- OAuth login flows for Codex, Claude, Gemini, Qwen, iFlow
+- Remote CPA configuration editor and log viewer
+- Dark/light theme with system preference detection
+- Saved connections stored locally in browser `localStorage`
+
+### Deploy to GitHub Pages
+
+1. Go to **Settings > Pages** in your GitHub repository
+2. Under **Build and deployment > Source**, select **GitHub Actions**
+3. Click **Save**
+4. Push any change to the `web` branch, or manually trigger the workflow at **Actions > Deploy Web UI to GitHub Pages > Run workflow**
+5. Your dashboard will be live at `https://<username>.github.io/<repo>/`
+
+### Deploy with Docker
+
+```bash
+docker build -t cpa-warden-web web/
+docker run -p 8080:80 cpa-warden-web
+```
+
+### Run locally
+
+```bash
+python3 -m http.server 8080 --directory web
+# Open http://localhost:8080
+```
+
+### CORS note
+
+The Web UI makes cross-origin requests from the browser to your CPA instance. This requires the CPA server to have `allow-remote-management: true` and send appropriate CORS headers. If CORS is blocked, either:
+
+- Deploy the Web UI on the same domain as your CPA instance
+- Use the Docker/nginx deployment with the reverse proxy config in `web/nginx.conf`
+
+## Scheduled Maintenance (GitHub Actions)
+
+The `maintain.yml` workflow runs automated scan + maintenance on multiple CPA instances and sends results to Feishu.
+
+### Setup
+
+1. Go to **Settings > Secrets and variables > Actions** in your GitHub repository
+
+2. Add the following **Repository secrets**:
+
+   **`CPA_INSTANCES`** — JSON array of CPA instances:
+   ```json
+   [
+     {"name": "instance-1", "url": "https://your-cpa-1.example.com", "token": "your-mgmt-token-1"},
+     {"name": "instance-2", "url": "https://your-cpa-2.example.com", "token": "your-mgmt-token-2"}
+   ]
+   ```
+
+   **`FEISHU_WEBHOOK`** — Feishu bot webhook URL:
+   ```
+   https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-id
+   ```
+
+3. The workflow runs automatically every 6 hours. You can also trigger it manually from **Actions > Scheduled Maintenance > Run workflow**.
+
+### What it does
+
+For each CPA instance, the workflow:
+
+- Fetches the auth file inventory
+- Probes usage quotas concurrently
+- Deletes accounts returning `401`
+- Disables accounts that have hit their quota limit
+- Re-enables accounts that have recovered
+- Sends a rich Feishu card notification with per-instance results
+
+### Customizing the schedule
+
+Edit the cron expression in `.github/workflows/maintain.yml`:
+
+```yaml
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+```
+
 ## Project Structure
 
 - `cpa_warden.py`: main entrypoint
 - `clean_codex_accounts.py`: compatibility wrapper for the old command name
 - `config.example.json`: example configuration
 - `pyproject.toml`: project metadata and dependencies
+- `web/`: browser-based dashboard (HTML/CSS/JS)
 - `.github/workflows/ci.yml`: basic CI checks
+- `.github/workflows/pages.yml`: GitHub Pages deployment
+- `.github/workflows/maintain.yml`: scheduled maintenance with Feishu notification
+- `.github/scripts/scheduled_maintain.py`: multi-instance maintenance runner
+- `.github/scripts/feishu_notify.py`: Feishu card notification sender
 
 ## Compatibility Note
 
