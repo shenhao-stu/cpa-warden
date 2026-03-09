@@ -213,12 +213,8 @@ def extract_action_result(line: str) -> tuple[int, int]:
 
 
 def mask_url(url: str) -> str:
-    """Remove protocol and mask middle of hostname for privacy."""
-    display = url.replace("https://", "").replace("http://", "").rstrip("/")
-    parts = display.split(".")
-    if len(parts) >= 3:
-        parts[0] = parts[0][:4] + "***"
-    return ".".join(parts)
+    """Remove protocol for display without masking the hostname."""
+    return url.replace("https://", "").replace("http://", "").rstrip("/")
 
 
 def main() -> int:
