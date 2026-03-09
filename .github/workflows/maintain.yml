@@ -2,8 +2,8 @@ name: Scheduled Maintenance
 
 on:
   schedule:
-    # Run every 6 hours
-    - cron: '0 */6 * * *'
+    # Run once per day
+    - cron: '7 3 * * *'
   workflow_dispatch:
 
 permissions:

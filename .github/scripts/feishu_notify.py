@@ -43,7 +43,7 @@ def build_card(result_data: dict | None, scan_status: str) -> dict:
         "tag": "div",
         "text": {
             "tag": "lark_md",
-            "content": f"🕐 **Execution Time:** {run_timestamp}",
+            "content": f"🕐 Execution Time: {run_timestamp}",
         },
     })
 
@@ -54,7 +54,7 @@ def build_card(result_data: dict | None, scan_status: str) -> dict:
         "tag": "div",
         "text": {
             "tag": "lark_md",
-            "content": f"📊 **Overall:** {success_count}/{total_count} instances succeeded",
+            "content": f"📊 Overall: {success_count}/{total_count} instances succeeded",
         },
     })
 
@@ -87,24 +87,22 @@ def build_card(result_data: dict | None, scan_status: str) -> dict:
             active_count = filtered - invalid_401 - quota_limited
 
             content_lines = [
-                f"{status_icon} **{name}**  `{url}`",
+                f"{status_icon} {name}  {url}",
                 f"━━━━━━━━━━━━━━━━━━━━",
-                f"📍 **Scan Results**",
-                f"   📦 Total: **{total}**  |  🎯 Filtered: **{filtered}**",
-                f"   ✅ Active: **{active_count}**  |  🚫 401: **{invalid_401}**  |  ⚠️ Quota: **{quota_limited}**",
-                f"   🔄 Recovered: **{recovered}**",
+                f"📍 Scan Results",
+                f"   📦 Total: {total}  |  🎯 Filtered: {filtered}",
+                f"   ✅ Active: {active_count}  |  🚫 401: {invalid_401}  |  ⚠️ Quota: {quota_limited}",
+                f"   🔄 Recovered: {recovered}",
             ]
 
-            # Only show action results if any actions were taken
+            # Always show 401 deletion status so the report makes it explicit
             has_actions = (delete_ok + delete_fail + quota_ok + quota_fail + reenable_ok + reenable_fail) > 0
-            if has_actions:
-                content_lines.append(f"📍 **Maintenance Actions**")
-                if delete_ok + delete_fail > 0:
-                    content_lines.append(f"   🗑️ Delete 401: ✅ {delete_ok}  ❌ {delete_fail}")
-                if quota_ok + quota_fail > 0:
-                    content_lines.append(f"   ⏸️ Quota Action: ✅ {quota_ok}  ❌ {quota_fail}")
-                if reenable_ok + reenable_fail > 0:
-                    content_lines.append(f"   ▶️ Re-enable: ✅ {reenable_ok}  ❌ {reenable_fail}")
+            content_lines.append(f"📍 Maintenance Actions")
+            content_lines.append(f"   🗑️ Delete 401: ✅ {delete_ok}  ❌ {delete_fail}")
+            if quota_ok + quota_fail > 0:
+                content_lines.append(f"   ⏸️ Quota Action: ✅ {quota_ok}  ❌ {quota_fail}")
+            if reenable_ok + reenable_fail > 0:
+                content_lines.append(f"   ▶️ Re-enable: ✅ {reenable_ok}  ❌ {reenable_fail}")
 
             content_lines.append(f"━━━━━━━━━━━━━━━━━━━━")
 
@@ -118,10 +116,10 @@ def build_card(result_data: dict | None, scan_status: str) -> dict:
         else:
             error = r.get("error", "Unknown error")
             content_lines = [
-                f"{status_icon} **{name}**  `{url}`",
+                f"{status_icon} {name}  {url}",
                 f"━━━━━━━━━━━━━━━━━━━━",
-                f"❌ **Status:** {status_text}",
-                f"📝 **Error:** {error}",
+                f"❌ Status: {status_text}",
+                f"📝 Error: {error}",
                 f"━━━━━━━━━━━━━━━━━━━━",
             ]
 
@@ -183,8 +181,8 @@ def build_error_card(timestamp: str, scan_status: str) -> dict:
                     "text": {
                         "tag": "lark_md",
                         "content": (
-                            f"🕐 **Time:** {timestamp}\n\n"
-                            f"❌ **Status:** {scan_status}\n\n"
+                            f"🕐 Time: {timestamp}\n\n"
+                            f"❌ Status: {scan_status}\n\n"
                             "The scheduled maintenance job failed to produce results.\n"
                             "Please check the GitHub Actions logs for details."
                         ),
