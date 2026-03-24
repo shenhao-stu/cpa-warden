@@ -26,12 +26,14 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install aiohttp rich requests
+        run: pip install aiohttp rich requests psycopg2-binary
 
       - name: Run maintenance scan
         id: scan
         env:
           CPA_INSTANCES: ${{ secrets.CPA_INSTANCES }}
+          GROK_PG_DSN: ${{ secrets.GROK_PG_DSN }}
+          GROK_TOKEN_MAX_AGE_H: "48"
         run: python3 .github/scripts/scheduled_maintain.py
 
       - name: Send Feishu notification
