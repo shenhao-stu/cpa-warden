@@ -133,6 +133,23 @@ def build_card(result_data: dict | None, scan_status: str) -> dict:
 
         elements.append({"tag": "hr"})
 
+    # Grok section
+    grok = result_data.get("grok")
+    if grok:
+        grok_lines = [
+            "🎮 Grok Token Maintenance",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"   📦 Before: {grok.get('total_before', 0)}  →  Active: {grok.get('active_after', 0)}",
+            f"   🗑️ Expired: {grok.get('expired_deleted', 0)}  |  Disabled: {grok.get('disabled_deleted', 0)}",
+            f"   🔄 Migrated: {grok.get('migrated', 0)}  |  NSFW: {grok.get('nsfw_enabled', 0)}",
+            f"━━━━━━━━━━━━━━━━━━━━",
+        ]
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "\n".join(grok_lines)},
+        })
+        elements.append({"tag": "hr"})
+
     # Footer
     elements.append({
         "tag": "note",

@@ -2,22 +2,27 @@
 """Scheduled CPA maintenance runner for GitHub Actions.
 
 Reads CPA_INSTANCES from environment (JSON array), runs scan+maintain
-on each instance, and outputs a structured result for notification.
+on each instance. Optionally cleans expired grok tokens and enables NSFW.
 
 Environment variables:
   CPA_INSTANCES: JSON array of {"name", "url", "token"} objects.
+  GROK_PG_DSN: PostgreSQL DSN for grok2api (optional).
+  GROK_TOKEN_MAX_AGE_H: Max token age in hours (default: 48).
   GITHUB_OUTPUT: GitHub Actions output file path.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def utc_now_iso() -> str:
@@ -217,6 +222,71 @@ def mask_url(url: str) -> str:
     return url.replace("https://", "").replace("http://", "").rstrip("/")
 
 
+def maintain_grok_tokens() -> dict | None:
+    """Clean expired grok tokens and enable NSFW. Returns stats or None."""
+    dsn = os.environ.get("GROK_PG_DSN", "")
+    if not dsn:
+        return None
+
+    max_age_h = int(os.environ.get("GROK_TOKEN_MAX_AGE_H", "48"))
+
+    try:
+        import psycopg2
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "psycopg2-binary", "-q"], check=True)
+        import psycopg2
+
+    parsed = urlparse(dsn)
+    host = parsed.hostname
+    kwargs = {"connect_timeout": 15}
+    if host:
+        try:
+            ipv4 = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+            kwargs["hostaddr"] = ipv4
+        except socket.gaierror:
+            pass
+
+    conn = psycopg2.connect(dsn, **kwargs)
+    cur = conn.cursor()
+    now_ts = int(time.time())
+    cutoff_ts = now_ts - max_age_h * 3600
+
+    cur.execute("SELECT count(*) FROM tokens")
+    total_before = cur.fetchone()[0]
+
+    cur.execute("SELECT count(*) FROM tokens WHERE created_at > 0 AND created_at < %s", (cutoff_ts,))
+    expired_count = cur.fetchone()[0]
+
+    cur.execute("SELECT count(*) FROM tokens WHERE status = 'disabled'")
+    disabled_count = cur.fetchone()[0]
+
+    # Delete expired
+    cur.execute("DELETE FROM tokens WHERE created_at > 0 AND created_at < %s", (cutoff_ts,))
+    # Delete disabled
+    cur.execute("DELETE FROM tokens WHERE status = 'disabled'")
+    # Migrate default → ssoBasic
+    cur.execute("UPDATE tokens SET pool_name = 'ssoBasic', status = 'active', tags = '[\"nsfw\"]' WHERE pool_name = 'default'")
+    migrated = cur.rowcount
+    # Enable NSFW
+    cur.execute("UPDATE tokens SET tags = '[\"nsfw\"]' WHERE pool_name = 'ssoBasic' AND (tags IS NULL OR tags = '[]' OR tags NOT LIKE '%%nsfw%%')")
+    nsfw_fixed = cur.rowcount
+
+    conn.commit()
+
+    cur.execute("SELECT count(*) FROM tokens WHERE status IN ('active', 'normal')")
+    active_after = cur.fetchone()[0]
+    conn.close()
+
+    return {
+        "total_before": total_before,
+        "expired_deleted": expired_count,
+        "disabled_deleted": disabled_count,
+        "migrated": migrated,
+        "nsfw_enabled": nsfw_fixed,
+        "active_after": active_after,
+    }
+
+
 def main() -> int:
     raw = os.environ.get("CPA_INSTANCES", "")
     if not raw:
@@ -263,10 +333,25 @@ def main() -> int:
     success_count = sum(1 for r in results if r["success"])
     print(f"Results: {success_count}/{len(results)} succeeded")
 
+    # Grok token maintenance
+    grok_result = None
+    if os.environ.get("GROK_PG_DSN"):
+        print("\n" + "=" * 60)
+        print("Grok token maintenance...")
+        try:
+            grok_result = maintain_grok_tokens()
+            if grok_result:
+                print(f"  Before: {grok_result['total_before']} -> Active: {grok_result['active_after']}")
+                print(f"  Expired: {grok_result['expired_deleted']} | Disabled: {grok_result['disabled_deleted']}")
+                print(f"  Migrated: {grok_result['migrated']} | NSFW: {grok_result['nsfw_enabled']}")
+        except Exception as exc:
+            print(f"  Grok maintenance failed: {exc}")
+
     # Write output for notification step
     output_data = {
         "timestamp": timestamp,
         "results": results,
+        "grok": grok_result,
         "success_count": success_count,
         "total_count": len(results),
         "all_success": all_success,
