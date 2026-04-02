@@ -378,7 +378,12 @@ The `maintain.yml` workflow runs automated scan + maintenance on multiple CPA in
    https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-id
    ```
 
-3. The workflow runs automatically every 6 hours. You can also trigger it manually from **Actions > Scheduled Maintenance > Run workflow**.
+   **`GROK_PG_DSN`** *(optional)* — PostgreSQL DSN for grok2api token cleanup:
+   ```
+   postgresql://user:pass@host/dbname?sslmode=require
+   ```
+
+3. The workflow runs automatically once per day (03:07 UTC). You can also trigger it manually from **Actions > Scheduled Maintenance > Run workflow**.
 
 ### What it does
 
@@ -398,7 +403,7 @@ Edit the cron expression in `.github/workflows/maintain.yml`:
 ```yaml
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '7 3 * * *'  # Daily at 03:07 UTC
 ```
 
 ## Project Structure
