@@ -287,6 +287,131 @@ def maintain_grok_tokens() -> dict | None:
     }
 
 
+def maintain_sub2api() -> dict | None:
+    """Health-check and cleanup codex (openai/oauth) accounts on sub2api.
+
+    Two-phase approach (CI version — GitHub runners can reach chatgpt.com directly):
+      1. Cross-reference: delete sub2api accounts not in any CPA instance
+      2. Direct probe: check remaining accounts via wham/usage
+    Returns stats dict or None if not configured.
+    """
+    base_url = os.environ.get("SUB2API_URL", "")
+    admin_email = os.environ.get("SUB2API_ADMIN_EMAIL", "")
+    admin_password = os.environ.get("SUB2API_ADMIN_PASSWORD", "")
+    if not base_url or not admin_email or not admin_password:
+        return None
+
+    import requests
+
+    base_url = base_url.rstrip("/")
+
+    # Login
+    resp = requests.post(
+        f"{base_url}/api/v1/auth/login",
+        json={"email": admin_email, "password": admin_password},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"sub2api login failed: {data.get('message', 'unknown')}")
+    jwt = data["data"]["access_token"]
+
+    hdrs = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
+
+    # List accounts
+    resp = requests.get(f"{base_url}/api/v1/admin/accounts?page_size=500", headers=hdrs, timeout=30)
+    resp.raise_for_status()
+    all_accounts = resp.json().get("data", {}).get("items", [])
+
+    codex_accounts = [a for a in all_accounts if a.get("platform") == "openai" and a.get("type") == "oauth"]
+
+    if not codex_accounts:
+        return {"total": len(all_accounts), "codex": 0, "cross_ref_deleted": 0, "probe_deleted": 0, "deleted_ok": 0, "deleted_fail": 0}
+
+    # --- Phase 1: Cross-reference with CPA ---
+    raw_instances = os.environ.get("CPA_INSTANCES", "")
+    cpa_active_emails: set = set()
+    if raw_instances:
+        try:
+            instances = json.loads(raw_instances)
+            for inst in instances:
+                try:
+                    cpa_hdrs = {"Authorization": f"Bearer {inst['token']}", "Content-Type": "application/json"}
+                    r = requests.get(f"{inst['url'].rstrip('/')}/v0/management/auth-files", headers=cpa_hdrs, timeout=30)
+                    r.raise_for_status()
+                    files_data = r.json()
+                    files = files_data.get("files", files_data) if isinstance(files_data, dict) else files_data
+                    for f in files:
+                        if f.get("type") == "codex" and not f.get("disabled", False):
+                            email = f.get("account") or f.get("email") or f.get("name", "")
+                            if email:
+                                cpa_active_emails.add(email.lower().strip())
+                except Exception as e:
+                    print(f"  Failed to list CPA {inst.get('name', '?')}: {e}")
+        except json.JSONDecodeError:
+            pass
+
+    stale_accounts = []
+    remaining_accounts = []
+    for acct in codex_accounts:
+        acct_email = (acct.get("name") or "").lower().strip()
+        if cpa_active_emails and acct_email and acct_email not in cpa_active_emails:
+            stale_accounts.append({"id": acct["id"], "name": acct.get("name", ""), "reason": "not_in_cpa"})
+        else:
+            remaining_accounts.append(acct)
+
+    # --- Phase 2: Direct probe (GitHub runners not Cloudflare-blocked) ---
+    delete_statuses = {401, 403, 500, 502, 503}
+    probe_error_accounts = []
+    probe_timeout_count = 0
+    for acct in remaining_accounts:
+        creds = acct.get("credentials", {})
+        access_token = creds.get("access_token", "")
+        if not access_token:
+            continue
+        try:
+            probe_resp = requests.get(
+                "https://chatgpt.com/backend-api/wham/usage",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+                },
+                timeout=20,
+            )
+            if probe_resp.status_code in delete_statuses:
+                probe_error_accounts.append({"id": acct["id"], "name": acct.get("name", ""), "reason": f"probe_{probe_resp.status_code}"})
+        except requests.exceptions.Timeout:
+            probe_timeout_count += 1
+        except Exception:
+            pass
+
+    if probe_timeout_count > 0:
+        print(f"  Sub2API probe: {probe_timeout_count} timeouts")
+
+    # --- Delete ---
+    all_to_delete = stale_accounts + probe_error_accounts
+    deleted_ok, deleted_fail = 0, 0
+    for ea in all_to_delete:
+        try:
+            resp = requests.delete(f"{base_url}/api/v1/admin/accounts/{ea['id']}", headers=hdrs, timeout=15)
+            if resp.json().get("code") == 0:
+                deleted_ok += 1
+            else:
+                deleted_fail += 1
+        except Exception:
+            deleted_fail += 1
+
+    return {
+        "total": len(all_accounts),
+        "codex": len(codex_accounts),
+        "cross_ref_deleted": len(stale_accounts),
+        "probe_deleted": len(probe_error_accounts),
+        "deleted_ok": deleted_ok,
+        "deleted_fail": deleted_fail,
+    }
+
+
 def main() -> int:
     raw = os.environ.get("CPA_INSTANCES", "")
     if not raw:
@@ -347,11 +472,25 @@ def main() -> int:
         except Exception as exc:
             print(f"  Grok maintenance failed: {exc}")
 
+    # Sub2API codex cleanup
+    sub2api_result = None
+    if os.environ.get("SUB2API_URL"):
+        print("\n" + "=" * 60)
+        print("Sub2API codex cleanup...")
+        try:
+            sub2api_result = maintain_sub2api()
+            if sub2api_result:
+                print(f"  Total: {sub2api_result['total']} | Codex: {sub2api_result['codex']}")
+                print(f"  Probed: {sub2api_result['probed']} | Deleted: ok={sub2api_result['deleted_ok']} fail={sub2api_result['deleted_fail']}")
+        except Exception as exc:
+            print(f"  Sub2API maintenance failed: {exc}")
+
     # Write output for notification step
     output_data = {
         "timestamp": timestamp,
         "results": results,
         "grok": grok_result,
+        "sub2api": sub2api_result,
         "success_count": success_count,
         "total_count": len(results),
         "all_success": all_success,

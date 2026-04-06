@@ -34,6 +34,9 @@ jobs:
           CPA_INSTANCES: ${{ secrets.CPA_INSTANCES }}
           GROK_PG_DSN: ${{ secrets.GROK_PG_DSN }}
           GROK_TOKEN_MAX_AGE_H: "48"
+          SUB2API_URL: ${{ secrets.SUB2API_URL }}
+          SUB2API_ADMIN_EMAIL: ${{ secrets.SUB2API_ADMIN_EMAIL }}
+          SUB2API_ADMIN_PASSWORD: ${{ secrets.SUB2API_ADMIN_PASSWORD }}
         run: python3 .github/scripts/scheduled_maintain.py
 
       - name: Send Feishu notification

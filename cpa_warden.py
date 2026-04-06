@@ -1643,7 +1643,7 @@ async def run_upload_async(
     stop_event = asyncio.Event()
 
     results = list(pre_results)
-    async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
+    async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True, headers={"Accept-Encoding": "gzip, deflate"}) as session:
         tasks = [
             asyncio.create_task(
                 upload_auth_file_async(
@@ -2021,7 +2021,7 @@ async def probe_accounts_async(
     semaphore = asyncio.Semaphore(max(1, probe_workers))
 
     results: list[dict[str, Any]] = []
-    async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
+    async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True, headers={"Accept-Encoding": "gzip, deflate"}) as session:
         tasks = [
             asyncio.create_task(
                 probe_wham_usage_async(
@@ -2294,7 +2294,7 @@ async def run_action_group_async(
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     semaphore = asyncio.Semaphore(max(1, workers))
 
-    async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
+    async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True, headers={"Accept-Encoding": "gzip, deflate"}) as session:
         tasks = []
         for name in items:
             if fn_name == "delete":

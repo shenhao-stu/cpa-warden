@@ -44,6 +44,15 @@ GROK_PG_DSN = os.environ.get("GROK_PG_DSN", "")
 # Max age (hours) for grok SSO tokens before they are considered expired
 GROK_TOKEN_MAX_AGE_H = int(os.environ.get("GROK_TOKEN_MAX_AGE_H", "48"))
 
+# sub2api (Codex account cleanup)
+SUB2API_URL = os.environ.get("SUB2API_URL", "")
+SUB2API_ADMIN_EMAIL = os.environ.get("SUB2API_ADMIN_EMAIL", "")
+SUB2API_ADMIN_PASSWORD = os.environ.get("SUB2API_ADMIN_PASSWORD", "")
+SUB2API_PG_DSN = os.environ.get("SUB2API_PG_DSN", "")
+
+# Backup directory for pre-cleanup snapshots (one per day)
+BACKUP_DIR = os.environ.get("BACKUP_DIR", str(Path(__file__).resolve().parent.parent / "backups"))
+
 # Which upstream API status codes trigger account deletion (in addition to 401).
 DELETE_STATUSES = {401, 403, 500, 502, 503}
 
@@ -258,6 +267,468 @@ def parse_log_stats(log_path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Backup: snapshot channel data before cleanup (daily rotation)
+# ---------------------------------------------------------------------------
+
+def _ensure_backup_dir() -> Path:
+    """Create backup directory if needed."""
+    p = Path(BACKUP_DIR)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def backup_cpa_accounts(url: str, token: str) -> str | None:
+    """Backup CPA auth-files list to a daily JSON file. Returns path or None."""
+    try:
+        hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        resp = requests.get(f"{url.rstrip('/')}/v0/management/auth-files", headers=hdrs, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        auth_files = data.get("files", data) if isinstance(data, dict) else data
+    except Exception as e:
+        print(f"  [Backup] Failed to list CPA {url}: {e}")
+        return None
+
+    date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    host = url.replace("https://", "").replace("http://", "").rstrip("/").replace("/", "_").replace(".", "_")
+    backup_path = _ensure_backup_dir() / f"cpa_{host}_{date_str}.json"
+    with open(backup_path, "w") as f:
+        json.dump(auth_files, f, ensure_ascii=False, indent=2)
+    print(f"  [Backup] CPA {url} -> {backup_path} ({len(auth_files)} accounts)")
+    return str(backup_path)
+
+
+def backup_sub2api_accounts() -> str | None:
+    """Backup sub2api accounts to a daily JSON file. Returns path or None."""
+    if not SUB2API_URL or not SUB2API_ADMIN_EMAIL or not SUB2API_ADMIN_PASSWORD:
+        return None
+    try:
+        jwt = _sub2api_login()
+        hdrs = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
+        resp = requests.get(
+            f"{SUB2API_URL.rstrip('/')}/api/v1/admin/accounts?page_size=500",
+            headers=hdrs, timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        items = data.get("items", [])
+    except Exception as e:
+        print(f"  [Backup] Failed to list sub2api: {e}")
+        return None
+
+    date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    backup_path = _ensure_backup_dir() / f"sub2api_{date_str}.json"
+    with open(backup_path, "w") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+    print(f"  [Backup] sub2api -> {backup_path} ({len(items)} accounts)")
+    return str(backup_path)
+
+
+def backup_grok_tokens() -> str | None:
+    """Backup grok tokens to a daily JSON file. Returns path or None."""
+    if not GROK_PG_DSN:
+        return None
+    try:
+        conn = _grok_pg_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT token, pool_name, status, tags, created_at FROM tokens")
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        conn.close()
+    except Exception as e:
+        print(f"  [Backup] Failed to read grok tokens: {e}")
+        return None
+
+    date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    backup_path = _ensure_backup_dir() / f"grok_tokens_{date_str}.json"
+    with open(backup_path, "w") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2, default=str)
+    print(f"  [Backup] grok -> {backup_path} ({len(rows)} tokens)")
+    return str(backup_path)
+
+
+def cleanup_old_backups(max_days: int = 7) -> None:
+    """Remove backup files older than max_days."""
+    backup_dir = Path(BACKUP_DIR)
+    if not backup_dir.exists():
+        return
+    cutoff = time.time() - max_days * 86400
+    for f in backup_dir.glob("*.json"):
+        if f.stat().st_mtime < cutoff:
+            f.unlink()
+            print(f"  [Backup] Removed old backup: {f.name}")
+
+
+# ---------------------------------------------------------------------------
+# sub2api: health-check + cleanup codex accounts
+# ---------------------------------------------------------------------------
+
+def _sub2api_login() -> str:
+    """Login to sub2api and return JWT token."""
+    resp = requests.post(
+        f"{SUB2API_URL.rstrip('/')}/api/v1/auth/login",
+        json={"email": SUB2API_ADMIN_EMAIL, "password": SUB2API_ADMIN_PASSWORD},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"sub2api login failed: {data.get('message', 'unknown')}")
+    return data["data"]["access_token"]
+
+
+def maintain_sub2api(dry_run: bool = False) -> dict:
+    """Health-check and cleanup codex (openai oauth) accounts on sub2api.
+
+    Two-phase approach:
+      1. Cross-reference: delete sub2api accounts whose emails are NOT in any CPA instance
+      2. Proxy probe: if proxy available, directly probe remaining accounts via wham/usage
+    Returns stats dict.
+    """
+    if not SUB2API_URL or not SUB2API_ADMIN_EMAIL or not SUB2API_ADMIN_PASSWORD:
+        print("  [Sub2API] Not configured, skipping")
+        return {}
+
+    try:
+        jwt = _sub2api_login()
+    except Exception as e:
+        print(f"  [Sub2API] Login failed: {e}")
+        return {"error": str(e)}
+
+    hdrs = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
+    base = SUB2API_URL.rstrip("/")
+
+    # List all sub2api accounts
+    try:
+        resp = requests.get(f"{base}/api/v1/admin/accounts?page_size=500", headers=hdrs, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        all_accounts = data.get("items", [])
+    except Exception as e:
+        print(f"  [Sub2API] List accounts failed: {e}")
+        return {"error": str(e)}
+
+    codex_accounts = [a for a in all_accounts if a.get("platform") == "openai" and a.get("type") == "oauth"]
+    print(f"  [Sub2API] Total accounts: {len(all_accounts)}, Codex (openai/oauth): {len(codex_accounts)}")
+
+    if not codex_accounts:
+        return {"total": len(all_accounts), "codex": 0, "cross_ref_deleted": 0, "probe_deleted": 0, "deleted_ok": 0, "deleted_fail": 0}
+
+    # --- Phase 1: Cross-reference with CPA active emails ---
+    cpa_urls = [u.strip() for u in CPA_BASE_URL.split(",") if u.strip()]
+    cpa_active_emails: set[str] = set()
+    for cpa_url in cpa_urls:
+        try:
+            cpa_hdrs = {"Authorization": f"Bearer {CPA_TOKEN}", "Content-Type": "application/json"}
+            r = requests.get(f"{cpa_url.rstrip('/')}/v0/management/auth-files", headers=cpa_hdrs, timeout=30)
+            r.raise_for_status()
+            files_data = r.json()
+            files = files_data.get("files", files_data) if isinstance(files_data, dict) else files_data
+            for f in files:
+                if f.get("type") == "codex" and not f.get("disabled", False):
+                    email = f.get("account") or f.get("email") or f.get("name", "")
+                    if email:
+                        cpa_active_emails.add(email.lower().strip())
+        except Exception as e:
+            print(f"  [Sub2API] Failed to list CPA {cpa_url}: {e}")
+
+    print(f"  [Sub2API] CPA active codex emails: {len(cpa_active_emails)}")
+
+    # Accounts in sub2api but not in any CPA instance → stale, delete
+    stale_accounts = []
+    remaining_accounts = []
+    for acct in codex_accounts:
+        acct_email = (acct.get("name") or "").lower().strip()
+        if cpa_active_emails and acct_email and acct_email not in cpa_active_emails:
+            stale_accounts.append({"id": acct["id"], "name": acct.get("name", ""), "reason": "not_in_cpa"})
+        else:
+            remaining_accounts.append(acct)
+
+    print(f"  [Sub2API] Stale (not in CPA): {len(stale_accounts)}, remaining for probe: {len(remaining_accounts)}")
+
+    # --- Phase 2: Proxy-based probing for remaining accounts ---
+    proxy_url = os.environ.get("PROBE_PROXY", "http://127.0.0.1:20171")
+    proxies = {"https": proxy_url, "http": proxy_url}
+    use_proxy = False
+    try:
+        requests.get("https://chatgpt.com", proxies=proxies, timeout=5)
+        use_proxy = True
+        print(f"  [Sub2API] Using proxy {proxy_url} for probing")
+    except Exception:
+        print(f"  [Sub2API] Proxy {proxy_url} not available, skipping probe phase")
+
+    probe_error_accounts = []
+    if use_proxy and remaining_accounts:
+        for acct in remaining_accounts:
+            creds = acct.get("credentials", {})
+            access_token = creds.get("access_token", "")
+            if not access_token:
+                continue
+            try:
+                probe_resp = requests.get(
+                    "https://chatgpt.com/backend-api/wham/usage",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+                    },
+                    proxies=proxies, timeout=20,
+                )
+                if probe_resp.status_code in DELETE_STATUSES:
+                    probe_error_accounts.append({"id": acct["id"], "name": acct.get("name", ""), "reason": f"probe_{probe_resp.status_code}"})
+            except Exception:
+                pass
+        print(f"  [Sub2API] Probed {len(remaining_accounts)}, found {len(probe_error_accounts)} invalid")
+
+    # --- Delete all identified accounts ---
+    all_to_delete = stale_accounts + probe_error_accounts
+
+    if dry_run:
+        return {"total": len(all_accounts), "codex": len(codex_accounts),
+                "cross_ref_deleted": len(stale_accounts), "probe_deleted": len(probe_error_accounts),
+                "deleted_ok": 0, "deleted_fail": 0}
+
+    deleted_ok, deleted_fail = 0, 0
+    for ea in all_to_delete:
+        try:
+            resp = requests.delete(f"{base}/api/v1/admin/accounts/{ea['id']}", headers=hdrs, timeout=15)
+            rdata = resp.json()
+            if rdata.get("code") == 0:
+                deleted_ok += 1
+                print(f"    Deleted: {ea['name']} ({ea['reason']})")
+            else:
+                deleted_fail += 1
+        except Exception:
+            deleted_fail += 1
+
+    print(f"  [Sub2API] Deleted: ok={deleted_ok} fail={deleted_fail}")
+    return {
+        "total": len(all_accounts),
+        "codex": len(codex_accounts),
+        "cross_ref_deleted": len(stale_accounts),
+        "probe_deleted": len(probe_error_accounts),
+        "deleted_ok": deleted_ok,
+        "deleted_fail": deleted_fail,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-sync: validated CPA accounts → other CPA instances + sub2api
+# ---------------------------------------------------------------------------
+
+def sync_validated_accounts(dry_run: bool = False) -> dict:
+    """Sync validated auth files across CPA instances and to sub2api.
+
+    After cleanup, CPA instances may have different account sets. This function:
+      1. Reads active account lists from each CPA instance
+      2. Gets full auth file content from the GitHub repo for accounts missing in each target
+      3. Uploads validated accounts to target CPA instances
+      4. Syncs to sub2api
+
+    Returns stats dict.
+    """
+    cpa_urls = [u.strip() for u in CPA_BASE_URL.split(",") if u.strip()]
+    if len(cpa_urls) < 2 and not SUB2API_URL:
+        print("  [Sync] Only one CPA target and no sub2api, skipping")
+        return {}
+
+    # Collect active account names+emails from each CPA instance, with validation
+    cpa_accounts: dict[str, dict[str, set]] = {}  # url → {"names": set, "emails": set}
+    for url in cpa_urls:
+        try:
+            hdrs = {"Authorization": f"Bearer {CPA_TOKEN}", "Content-Type": "application/json"}
+            resp = requests.get(f"{url.rstrip('/')}/v0/management/auth-files", headers=hdrs, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            files = data.get("files", data) if isinstance(data, dict) else data
+            active = [f for f in files if f.get("type") == "codex" and not f.get("disabled", False)]
+
+            # Validate each active account via wham/usage probe
+            validated = []
+            invalid_names = []
+            for af in active:
+                name = af.get("name", "")
+                auth_index = af.get("auth_index", "")
+                account_id = (af.get("id_token") or {}).get("chatgpt_account_id", "")
+                if not name:
+                    continue
+
+                # Try CPA api-call probe if auth_index + account_id available
+                if auth_index and account_id:
+                    payload = {
+                        "authIndex": auth_index,
+                        "method": "GET",
+                        "url": "https://chatgpt.com/backend-api/wham/usage",
+                        "header": {
+                            "Authorization": "Bearer $TOKEN$",
+                            "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+                            "Chatgpt-Account-Id": account_id,
+                        },
+                    }
+                    try:
+                        pr = requests.post(f"{url.rstrip('/')}/v0/management/api-call", headers=hdrs, json=payload, timeout=20)
+                        if pr.status_code == 200:
+                            pr_data = pr.json()
+                            status = pr_data.get("status_code", 0)
+                            if status in DELETE_STATUSES:
+                                invalid_names.append(name)
+                                continue
+                    except Exception:
+                        pass
+                # If we can't probe (missing fields), trust the CPA's active status
+                validated.append(af)
+
+            # Delete invalidated accounts
+            for inv_name in invalid_names:
+                if not dry_run:
+                    encoded = urllib.parse.quote(inv_name, safe="")
+                    requests.delete(f"{url.rstrip('/')}/v0/management/auth-files?name={encoded}", headers=hdrs, timeout=15)
+            if invalid_names:
+                print(f"  [Sync] {url}: validated {len(validated)}, removed {len(invalid_names)} invalid")
+
+            names = {f.get("name", "") for f in validated if f.get("name")}
+            emails = {(f.get("email") or f.get("account") or "").lower().strip() for f in validated}
+            emails.discard("")
+            cpa_accounts[url] = {"names": names, "emails": emails}
+            print(f"  [Sync] {url}: {len(names)} validated codex")
+        except Exception as e:
+            print(f"  [Sync] Failed to list {url}: {e}")
+            cpa_accounts[url] = {"names": set(), "emails": set()}
+
+    # Build union of all active names across all CPA instances
+    all_active_names: set[str] = set()
+    for info in cpa_accounts.values():
+        all_active_names |= info["names"]
+
+    if not all_active_names:
+        print("  [Sync] No active accounts found, skipping")
+        return {"synced_cpa": 0, "synced_sub2api": 0}
+
+    # Get list of auth files from GitHub repo
+    if not GH_TOKEN:
+        print("  [Sync] GH_TOKEN not set, skipping GitHub-based sync")
+        return {"synced_cpa": 0, "synced_sub2api": 0}
+
+    gh_files = gh_list_auth_files()  # {name: sha}
+    print(f"  [Sync] GitHub repo: {len(gh_files)} auth files")
+
+    # For each CPA instance, find accounts missing from it but present in another
+    total_synced_cpa = 0
+    for target_url in cpa_urls:
+        target_names = cpa_accounts[target_url]["names"]
+        # Accounts active in OTHER instances but not in this one
+        missing = all_active_names - target_names
+        # Only sync files that exist in GitHub
+        to_sync = [name for name in missing if name in gh_files]
+
+        if not to_sync:
+            continue
+
+        print(f"  [Sync] {target_url}: {len(to_sync)} accounts to sync from GitHub")
+        if dry_run:
+            continue
+
+        synced = 0
+        for name in to_sync[:200]:  # Cap at 200 per run
+            try:
+                # Read auth file content from GitHub
+                file_url = f"https://api.github.com/repos/{GIT_REPO}/contents/{GIT_AUTH_DIR}/{urllib.parse.quote(name, safe='')}"
+                resp = requests.get(file_url, headers=gh_headers(), params={"ref": GIT_BRANCH}, timeout=15)
+                if resp.status_code != 200:
+                    continue
+                content = base64.b64decode(resp.json()["content"]).decode("utf-8")
+
+                # Upload to target CPA
+                encoded = urllib.parse.quote(name, safe="")
+                upload_url = f"{target_url.rstrip('/')}/v0/management/auth-files?name={encoded}"
+                up_resp = requests.post(
+                    upload_url,
+                    headers={"Authorization": f"Bearer {CPA_TOKEN}", "Content-Type": "application/json"},
+                    data=content, timeout=15,
+                )
+                if up_resp.status_code == 200:
+                    synced += 1
+            except Exception:
+                pass
+
+        print(f"  [Sync] {target_url}: synced {synced}/{len(to_sync)}")
+        total_synced_cpa += synced
+
+    # Sync to sub2api: upload CPA accounts not yet in sub2api
+    synced_sub2api = 0
+    if SUB2API_URL and SUB2API_ADMIN_EMAIL and SUB2API_ADMIN_PASSWORD:
+        try:
+            jwt = _sub2api_login()
+            hdrs = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
+            resp = requests.get(f"{SUB2API_URL.rstrip('/')}/api/v1/admin/accounts?page_size=500", headers=hdrs, timeout=30)
+            resp.raise_for_status()
+            s2a_items = resp.json().get("data", {}).get("items", [])
+            s2a_emails = {(a.get("name") or "").lower().strip() for a in s2a_items}
+            s2a_emails.discard("")
+
+            # Union of all CPA active emails
+            all_active_emails: set[str] = set()
+            for info in cpa_accounts.values():
+                all_active_emails |= info["emails"]
+
+            missing_emails = all_active_emails - s2a_emails
+            print(f"  [Sync] Sub2API: {len(s2a_items)} existing, {len(missing_emails)} to sync")
+
+            if not dry_run and missing_emails:
+                # Read auth files from GitHub to get access_token for sub2api upload
+                for name in sorted(all_active_names):
+                    if name not in gh_files:
+                        continue
+                    try:
+                        file_url = f"https://api.github.com/repos/{GIT_REPO}/contents/{GIT_AUTH_DIR}/{urllib.parse.quote(name, safe='')}"
+                        resp = requests.get(file_url, headers=gh_headers(), params={"ref": GIT_BRANCH}, timeout=15)
+                        if resp.status_code != 200:
+                            continue
+                        import base64
+                        auth_data = json.loads(base64.b64decode(resp.json()["content"]).decode("utf-8"))
+                        email = (auth_data.get("email") or "").lower().strip()
+                        if email not in missing_emails:
+                            continue
+
+                        # Upload to sub2api
+                        payload = {
+                            "name": email,
+                            "platform": "openai",
+                            "type": "oauth",
+                            "credentials": {
+                                "access_token": auth_data.get("access_token", ""),
+                                "refresh_token": auth_data.get("refresh_token", ""),
+                            },
+                        }
+                        exp_val = auth_data.get("expired", "")
+                        if isinstance(exp_val, str) and exp_val:
+                            try:
+                                dt = datetime.fromisoformat(exp_val.replace("Z", "+00:00"))
+                                payload["expires_at"] = int(dt.timestamp())
+                            except ValueError:
+                                pass
+
+                        up_resp = requests.post(
+                            f"{SUB2API_URL.rstrip('/')}/api/v1/admin/accounts",
+                            headers=hdrs, json=payload, timeout=15,
+                        )
+                        if up_resp.status_code in (200, 201) and up_resp.json().get("code") == 0:
+                            synced_sub2api += 1
+                            missing_emails.discard(email)
+                    except Exception:
+                        pass
+
+                    if synced_sub2api >= 200:  # Cap per run
+                        break
+
+                print(f"  [Sync] Sub2API: synced {synced_sub2api}")
+
+        except Exception as e:
+            print(f"  [Sync] Sub2API sync failed: {e}")
+
+    return {"synced_cpa": total_synced_cpa, "synced_sub2api": synced_sub2api}
+
+
+# ---------------------------------------------------------------------------
 # Extended cleanup: delete 5xx accounts + Git sync
 # ---------------------------------------------------------------------------
 
@@ -287,8 +758,16 @@ def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False
         }
         try:
             resp = requests.post(f"{_url}/v0/management/api-call", headers=hdrs, json=payload, timeout=20)
-            if resp.status_code in DELETE_STATUSES:
-                error_accounts.append({"name": name, "status": resp.status_code})
+            # CPA api-call returns HTTP 200 with upstream status in JSON body
+            upstream_status = resp.status_code
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    upstream_status = data.get("status_code", resp.status_code)
+                except Exception:
+                    pass
+            if upstream_status in DELETE_STATUSES:
+                error_accounts.append({"name": name, "status": upstream_status})
         except Exception:
             pass
 
@@ -354,7 +833,7 @@ def sync_git_deletions(deleted_names: list[str], dry_run: bool = False) -> dict:
 # Feishu notification
 # ---------------------------------------------------------------------------
 
-def send_feishu(warden_stats: dict, error_stats: dict, git_stats: dict, grok_stats: dict | None = None) -> None:
+def send_feishu(warden_stats: dict, error_stats: dict, git_stats: dict, grok_stats: dict | None = None, sub2api_stats: dict | None = None, sync_stats: dict | None = None) -> None:
     if not FEISHU_WEBHOOK:
         print("  [Feishu] Webhook not set, skipping")
         return
@@ -394,6 +873,42 @@ def send_feishu(warden_stats: dict, error_stats: dict, git_stats: dict, grok_sta
             f"   🗑️ Expired: {grok_stats.get('expired_deleted', 0)}  |  Disabled: {grok_stats.get('disabled_deleted', 0)}",
             f"   🔄 Migrated: {grok_stats.get('migrated_to_ssoBasic', 0)}  |  NSFW: {grok_stats.get('nsfw_enabled', 0)}",
         ])
+
+    if sub2api_stats and not sub2api_stats.get("error"):
+        s2a_del_ok = sub2api_stats.get("deleted_ok", 0)
+        s2a_del_fail = sub2api_stats.get("deleted_fail", 0)
+        s2a_xref = sub2api_stats.get("cross_ref_deleted", 0)
+        s2a_probe = sub2api_stats.get("probe_deleted", 0)
+        if s2a_del_fail > 0:
+            all_ok = False
+        lines.extend([
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"📍 Sub2API — Codex Cleanup ({SUB2API_URL})",
+            f"   📦 Total: {sub2api_stats.get('total', 0)}  |  🎯 Codex: {sub2api_stats.get('codex', 0)}",
+            f"   🔗 Cross-ref stale: {s2a_xref}  |  🔍 Probe invalid: {s2a_probe}",
+            f"   🗑️ Deleted: ✅ {s2a_del_ok}  ❌ {s2a_del_fail}",
+        ])
+
+    if git_stats:
+        g_synced = git_stats.get("synced", 0)
+        g_skipped = git_stats.get("skipped", 0)
+        g_not_in_git = git_stats.get("not_in_git", 0)
+        if g_synced + g_skipped + g_not_in_git > 0:
+            lines.extend([
+                f"━━━━━━━━━━━━━━━━━━━━",
+                f"📍 Git Sync — Repo Cleanup",
+                f"   🗑️ Removed: {g_synced}  |  Skipped: {g_skipped}  |  Not in Git: {g_not_in_git}",
+            ])
+
+    if sync_stats:
+        s_cpa = sync_stats.get("synced_cpa", 0)
+        s_sub = sync_stats.get("synced_sub2api", 0)
+        if s_cpa + s_sub > 0:
+            lines.extend([
+                f"━━━━━━━━━━━━━━━━━━━━",
+                f"📍 Cross-Sync — Validated Accounts",
+                f"   ↗️ CPA: {s_cpa}  |  Sub2API: {s_sub}",
+            ])
 
     lines.extend([
         f"━━━━━━━━━━━━━━━━━━━━",
@@ -542,9 +1057,19 @@ def main() -> int:
     print(f"  Targets: {', '.join(cpa_urls)}")
     print()
 
+    # Step 0: Backup all channel data before cleanup
+    print("[Step 0] Backing up account data...")
+    for url in cpa_urls:
+        backup_cpa_accounts(url, CPA_TOKEN)
+    backup_sub2api_accounts()
+    backup_grok_tokens()
+    cleanup_old_backups(max_days=7)
+    print()
+
     # Step 1-2: CPA maintenance for each instance
     all_warden: dict = {}
     all_error: dict = {"probed": 0, "deleted_ok": 0, "deleted_fail": 0}
+    all_deleted_names: list[str] = []  # Track all deleted names for Git sync
 
     for idx, url in enumerate(cpa_urls, 1):
         print(f"[CPA {idx}/{len(cpa_urls)}] {url}")
@@ -580,9 +1105,11 @@ def main() -> int:
                 for k in ("total", "filtered", "invalid_401", "quota_limited", "delete_401_ok", "delete_401_fail"):
                     all_warden[k] = all_warden.get(k, 0) + warden_stats.get(k, 0)
                 all_warden["elapsed"] = all_warden.get("elapsed", 0) + warden_stats.get("elapsed", 0)
+            all_deleted_names.extend(warden_stats.get("deleted_401_names", []))
         all_error["probed"] += error_stats.get("probed", 0)
         all_error["deleted_ok"] += error_stats.get("deleted_ok", 0)
         all_error["deleted_fail"] += error_stats.get("deleted_fail", 0)
+        all_deleted_names.extend(error_stats.get("names", []))
         print()
 
     # Step 3: Grok token maintenance
@@ -593,11 +1120,28 @@ def main() -> int:
         print(f"  Disabled deleted: {grok_stats['disabled_deleted']} | Migrated to ssoBasic: {grok_stats['migrated_to_ssoBasic']}")
         print(f"  NSFW enabled: {grok_stats['nsfw_enabled']} | Active after: {grok_stats['active_after']}")
 
-    # Step 4: Feishu notification
-    print("\n[Step 4] Sending Feishu notification...")
-    git_stats: dict = {}
+    # Step 4: Sub2API codex cleanup
+    print("\n[Step 4] Sub2API codex cleanup...")
+    sub2api_stats = maintain_sub2api(dry_run=args.dry_run)
+    if sub2api_stats and not sub2api_stats.get("error"):
+        print(f"  Total: {sub2api_stats.get('total', 0)} | Codex: {sub2api_stats.get('codex', 0)}")
+        print(f"  Deleted: ok={sub2api_stats.get('deleted_ok', 0)} fail={sub2api_stats.get('deleted_fail', 0)}")
+
+    # Step 5: Git sync — remove deleted auth files from GitHub repo
+    print("\n[Step 5] Git sync (delete from repo)...")
+    unique_deleted = list(set(all_deleted_names))
+    git_stats = sync_git_deletions(unique_deleted, dry_run=args.dry_run)
+
+    # Step 6: Cross-sync validated accounts across CPA instances + sub2api
+    print("\n[Step 6] Cross-sync validated accounts...")
+    sync_stats = sync_validated_accounts(dry_run=args.dry_run)
+    if sync_stats:
+        print(f"  CPA synced: {sync_stats.get('synced_cpa', 0)} | Sub2API synced: {sync_stats.get('synced_sub2api', 0)}")
+
+    # Step 7: Feishu notification
+    print("\n[Step 7] Sending Feishu notification...")
     if not args.dry_run:
-        send_feishu(all_warden, all_error, git_stats, grok_stats)
+        send_feishu(all_warden, all_error, git_stats, grok_stats, sub2api_stats, sync_stats)
     else:
         print("  [DRY-RUN] Skipping Feishu notification")
 
