@@ -104,17 +104,19 @@ def cpa_delete_auth_file(name: str) -> bool:
     return resp.status_code == 200
 
 
-def cpa_probe_account(name: str) -> dict | None:
+def cpa_probe_account(name: str, auth_index: str = "", account_id: str = "") -> dict | None:
     """POST /v0/management/api-call to probe a single account's wham/usage.
 
     Returns the parsed JSON body, or None on failure.
     """
     payload = {
-        "auth_name": name,
+        "authIndex": auth_index or name,
         "method": "GET",
         "url": "https://chatgpt.com/backend-api/wham/usage",
-        "headers": {
+        "header": {
+            "Authorization": "Bearer $TOKEN$",
             "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+            **({"Chatgpt-Account-Id": account_id} if account_id else {}),
         },
     }
     try:
@@ -315,7 +317,7 @@ def backup_sub2api_accounts() -> str | None:
         jwt = _sub2api_login()
         hdrs = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
         resp = requests.get(
-            f"{SUB2API_URL.rstrip('/')}/api/v1/admin/accounts?page_size=500",
+            f"{SUB2API_URL.rstrip('/')}/api/v1/admin/accounts?page_size=100",
             headers=hdrs, timeout=30,
         )
         resp.raise_for_status()
@@ -457,12 +459,20 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
     hdrs = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
     base = SUB2API_URL.rstrip("/")
 
-    # List all sub2api accounts
+    # List all sub2api accounts (paginated — may have thousands due to duplicates)
+    all_accounts: list[dict] = []
     try:
-        resp = requests.get(f"{base}/api/v1/admin/accounts?page_size=500", headers=hdrs, timeout=30)
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
-        all_accounts = data.get("items", [])
+        page = 1
+        while True:
+            resp = requests.get(f"{base}/api/v1/admin/accounts?page={page}&page_size=100", headers=hdrs, timeout=30)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            items = data.get("items", [])
+            all_accounts.extend(items)
+            total = data.get("total", 0)
+            if len(all_accounts) >= total or not items:
+                break
+            page += 1
     except Exception as e:
         print(f"  [Sub2API] List accounts failed: {e}")
         return {"error": str(e)}
@@ -475,8 +485,47 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
     print(f"  [Sub2API] Total accounts: {len(all_accounts)}, Codex free (openai/oauth): {len(codex_accounts)}")
 
     if not codex_accounts:
-        return {"total": len(all_accounts), "codex": 0, "cross_ref_deleted": 0,
+        return {"total": len(all_accounts), "codex": 0, "dedup_deleted": 0, "cross_ref_deleted": 0,
                 "test_deleted": 0, "quota_skipped": 0, "deleted_ok": 0, "deleted_fail": 0}
+
+    # --- Phase 0: Deduplicate — keep newest (highest id) per name, delete rest ---
+    from collections import defaultdict
+    name_groups: dict[str, list[dict]] = defaultdict(list)
+    for acct in codex_accounts:
+        acct_name = (acct.get("name") or "").lower().strip()
+        if acct_name:
+            name_groups[acct_name].append(acct)
+
+    dedup_to_delete: list[dict] = []
+    deduplicated_accounts: list[dict] = []
+    for name, group in name_groups.items():
+        if len(group) > 1:
+            # Sort by id descending — keep the newest
+            group.sort(key=lambda a: a.get("id", 0), reverse=True)
+            deduplicated_accounts.append(group[0])  # keep newest
+            for dup in group[1:]:
+                dedup_to_delete.append({"id": dup["id"], "name": dup.get("name", ""), "reason": "duplicate"})
+        else:
+            deduplicated_accounts.append(group[0])
+
+    dedup_deleted_ok = 0
+    if dedup_to_delete:
+        print(f"  [Sub2API] Dedup: {len(dedup_to_delete)} duplicates to remove (keeping newest per name)")
+        if not dry_run:
+            for ea in dedup_to_delete:
+                try:
+                    resp = requests.delete(f"{base}/api/v1/admin/accounts/{ea['id']}", headers=hdrs, timeout=15)
+                    rdata = resp.json()
+                    if rdata.get("code") == 0:
+                        dedup_deleted_ok += 1
+                except Exception:
+                    pass
+            print(f"  [Sub2API] Dedup deleted: {dedup_deleted_ok}/{len(dedup_to_delete)}")
+    else:
+        print(f"  [Sub2API] No duplicates found")
+
+    # Use deduplicated list for subsequent phases
+    codex_accounts = deduplicated_accounts
 
     # --- Phase 1: Cross-reference with CPA active emails ---
     cpa_urls = [u.strip() for u in CPA_BASE_URL.split(",") if u.strip()]
@@ -535,6 +584,7 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
 
     if dry_run:
         return {"total": len(all_accounts), "codex": len(codex_accounts),
+                "dedup_deleted": len(dedup_to_delete),
                 "cross_ref_deleted": len(stale_accounts), "test_deleted": len(test_error_accounts),
                 "quota_skipped": quota_skipped, "deleted_ok": 0, "deleted_fail": 0}
 
@@ -555,6 +605,7 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
     return {
         "total": len(all_accounts),
         "codex": len(codex_accounts),
+        "dedup_deleted": dedup_deleted_ok,
         "cross_ref_deleted": len(stale_accounts),
         "test_deleted": len(test_error_accounts),
         "quota_skipped": quota_skipped,
@@ -713,9 +764,19 @@ def sync_validated_accounts(dry_run: bool = False) -> dict:
         try:
             jwt = _sub2api_login()
             hdrs = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
-            resp = requests.get(f"{SUB2API_URL.rstrip('/')}/api/v1/admin/accounts?page_size=500", headers=hdrs, timeout=30)
-            resp.raise_for_status()
-            s2a_items = resp.json().get("data", {}).get("items", [])
+            # Paginated listing to avoid missing accounts and creating duplicates
+            s2a_items: list = []
+            s2a_page = 1
+            while True:
+                resp = requests.get(f"{SUB2API_URL.rstrip('/')}/api/v1/admin/accounts?page={s2a_page}&page_size=100", headers=hdrs, timeout=30)
+                resp.raise_for_status()
+                s2a_data = resp.json().get("data", {})
+                page_items = s2a_data.get("items", [])
+                s2a_items.extend(page_items)
+                s2a_total = s2a_data.get("total", 0)
+                if len(s2a_items) >= s2a_total or not page_items:
+                    break
+                s2a_page += 1
             s2a_emails = {(a.get("name") or "").lower().strip() for a in s2a_items}
             s2a_emails.discard("")
 
@@ -812,12 +873,19 @@ def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False
 
     for af in candidates:
         name = af.get("name", "")
-        if not name:
+        auth_index = af.get("auth_index", "")
+        account_id = (af.get("id_token") or {}).get("chatgpt_account_id", "")
+        if not name or not auth_index:
             continue
         payload = {
-            "auth_name": name, "method": "GET",
+            "authIndex": auth_index,
+            "method": "GET",
             "url": "https://chatgpt.com/backend-api/wham/usage",
-            "headers": {"User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"},
+            "header": {
+                "Authorization": "Bearer $TOKEN$",
+                "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+                **({"Chatgpt-Account-Id": account_id} if account_id else {}),
+            },
         }
         try:
             resp = requests.post(f"{_url}/v0/management/api-call", headers=hdrs, json=payload, timeout=20)
@@ -970,6 +1038,7 @@ def send_feishu(warden_stats: dict, error_stats: dict, git_stats: dict, grok_sta
     if sub2api_stats and not sub2api_stats.get("error"):
         s2a_del_ok = sub2api_stats.get("deleted_ok", 0)
         s2a_del_fail = sub2api_stats.get("deleted_fail", 0)
+        s2a_dedup = sub2api_stats.get("dedup_deleted", 0)
         s2a_xref = sub2api_stats.get("cross_ref_deleted", 0)
         s2a_test = sub2api_stats.get("test_deleted", 0)
         s2a_quota = sub2api_stats.get("quota_skipped", 0)
@@ -979,7 +1048,7 @@ def send_feishu(warden_stats: dict, error_stats: dict, git_stats: dict, grok_sta
             f"━━━━━━━━━━━━━━━━━━━━",
             f"📍 Sub2API — Codex Cleanup ({SUB2API_URL})",
             f"   📦 Total: {sub2api_stats.get('total', 0)}  |  🎯 Codex: {sub2api_stats.get('codex', 0)}",
-            f"   🔗 Cross-ref stale: {s2a_xref}  |  🚫 Test 401: {s2a_test}  |  ⏸️ Quota 429: {s2a_quota}",
+            f"   🔄 Dedup: {s2a_dedup}  |  🔗 Stale: {s2a_xref}  |  🚫 401: {s2a_test}  |  ⏸️ 429: {s2a_quota}",
             f"   🗑️ Deleted: ✅ {s2a_del_ok}  ❌ {s2a_del_fail}",
         ])
 

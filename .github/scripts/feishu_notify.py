@@ -153,6 +153,7 @@ def build_card(result_data: dict | None, scan_status: str) -> dict:
     # Sub2API section
     sub2api = result_data.get("sub2api")
     if sub2api:
+        s2a_dedup = sub2api.get('dedup_deleted', 0)
         s2a_xref = sub2api.get('cross_ref_deleted', 0)
         s2a_test = sub2api.get('test_deleted', 0)
         s2a_quota = sub2api.get('quota_skipped', 0)
@@ -160,7 +161,7 @@ def build_card(result_data: dict | None, scan_status: str) -> dict:
             "🔗 Sub2API Codex Cleanup",
             f"━━━━━━━━━━━━━━━━━━━━",
             f"   📦 Total: {sub2api.get('total', 0)}  |  🎯 Codex: {sub2api.get('codex', 0)}",
-            f"   🔗 Cross-ref stale: {s2a_xref}  |  🚫 Test 401: {s2a_test}  |  ⏸️ Quota 429: {s2a_quota}",
+            f"   🔄 Dedup: {s2a_dedup}  |  🔗 Stale: {s2a_xref}  |  🚫 401: {s2a_test}  |  ⏸️ 429: {s2a_quota}",
             f"   🗑️ Deleted: ✅ {sub2api.get('deleted_ok', 0)}  ❌ {sub2api.get('deleted_fail', 0)}",
             f"━━━━━━━━━━━━━━━━━━━━",
         ]

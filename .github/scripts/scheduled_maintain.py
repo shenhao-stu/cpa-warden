@@ -370,10 +370,19 @@ def maintain_sub2api() -> dict | None:
 
     hdrs = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
 
-    # List accounts
-    resp = requests.get(f"{base_url}/api/v1/admin/accounts?page_size=500", headers=hdrs, timeout=30)
-    resp.raise_for_status()
-    all_accounts = resp.json().get("data", {}).get("items", [])
+    # List all accounts (paginated)
+    all_accounts: list = []
+    page = 1
+    while True:
+        resp = requests.get(f"{base_url}/api/v1/admin/accounts?page={page}&page_size=100", headers=hdrs, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        items = data.get("items", [])
+        all_accounts.extend(items)
+        total = data.get("total", 0)
+        if len(all_accounts) >= total or not items:
+            break
+        page += 1
 
     codex_accounts = [
         a for a in all_accounts
@@ -382,8 +391,41 @@ def maintain_sub2api() -> dict | None:
     ]
 
     if not codex_accounts:
-        return {"total": len(all_accounts), "codex": 0, "cross_ref_deleted": 0,
+        return {"total": len(all_accounts), "codex": 0, "dedup_deleted": 0, "cross_ref_deleted": 0,
                 "test_deleted": 0, "quota_skipped": 0, "deleted_ok": 0, "deleted_fail": 0}
+
+    # --- Phase 0: Deduplicate — keep newest (highest id) per name, delete rest ---
+    from collections import defaultdict
+    name_groups: dict[str, list] = defaultdict(list)
+    for acct in codex_accounts:
+        acct_name = (acct.get("name") or "").lower().strip()
+        if acct_name:
+            name_groups[acct_name].append(acct)
+
+    dedup_to_delete: list = []
+    deduplicated_accounts: list = []
+    for name, group in name_groups.items():
+        if len(group) > 1:
+            group.sort(key=lambda a: a.get("id", 0), reverse=True)
+            deduplicated_accounts.append(group[0])
+            for dup in group[1:]:
+                dedup_to_delete.append({"id": dup["id"], "name": dup.get("name", ""), "reason": "duplicate"})
+        else:
+            deduplicated_accounts.append(group[0])
+
+    dedup_deleted_ok = 0
+    if dedup_to_delete:
+        print(f"  Sub2API dedup: {len(dedup_to_delete)} duplicates to remove")
+        for ea in dedup_to_delete:
+            try:
+                resp = requests.delete(f"{base_url}/api/v1/admin/accounts/{ea['id']}", headers=hdrs, timeout=15)
+                if resp.json().get("code") == 0:
+                    dedup_deleted_ok += 1
+            except Exception:
+                pass
+        print(f"  Sub2API dedup deleted: {dedup_deleted_ok}/{len(dedup_to_delete)}")
+
+    codex_accounts = deduplicated_accounts
 
     # --- Phase 1: Cross-reference with CPA ---
     raw_instances = os.environ.get("CPA_INSTANCES", "")
@@ -452,6 +494,7 @@ def maintain_sub2api() -> dict | None:
     return {
         "total": len(all_accounts),
         "codex": len(codex_accounts),
+        "dedup_deleted": dedup_deleted_ok,
         "cross_ref_deleted": len(stale_accounts),
         "test_deleted": len(test_error_accounts),
         "quota_skipped": quota_skipped,
