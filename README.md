@@ -383,6 +383,15 @@ The `maintain.yml` workflow runs automated scan + maintenance on multiple CPA in
    postgresql://user:pass@host/dbname?sslmode=require
    ```
 
+   **`SUB2API_URL`** *(optional)* — Sub2API base URL for codex account cleanup:
+   ```
+   https://sub2api.example.com
+   ```
+
+   **`SUB2API_ADMIN_EMAIL`** *(optional)* — Sub2API admin login email
+
+   **`SUB2API_ADMIN_PASSWORD`** *(optional)* — Sub2API admin login password
+
 3. The workflow runs automatically once per day (03:07 UTC). You can also trigger it manually from **Actions > Scheduled Maintenance > Run workflow**.
 
 ### What it does
@@ -394,7 +403,16 @@ For each CPA instance, the workflow:
 - Deletes accounts returning `401`
 - Disables accounts that have hit their quota limit
 - Re-enables accounts that have recovered
-- Sends a rich Feishu card notification with per-instance results
+
+If `SUB2API_URL` is configured, it also:
+
+- Lists codex free group accounts (openai/oauth only)
+- Cross-references with CPA instances to remove stale accounts
+- Tests remaining accounts via the sub2api test API (`model: gpt-5.4`)
+- Deletes accounts with permanently invalidated tokens (401 `token_invalidated`)
+- Preserves accounts that only hit the weekly quota limit (429)
+
+Sends a rich Feishu card notification with per-instance and sub2api results.
 
 ### Customizing the schedule
 
@@ -411,11 +429,12 @@ on:
 - `cpa_warden.py`: main entrypoint
 - `config.example.json`: example configuration
 - `pyproject.toml`: project metadata and dependencies
+- `scripts/daily-maintain.py`: local daily maintenance (multi-CPA + grok + sub2api + Git sync + Feishu)
 - `web/`: browser-based dashboard (HTML/CSS/JS)
 - `.github/workflows/ci.yml`: basic CI checks
 - `.github/workflows/pages.yml`: GitHub Pages deployment
 - `.github/workflows/maintain.yml`: scheduled maintenance with Feishu notification
-- `.github/scripts/scheduled_maintain.py`: multi-instance maintenance runner
+- `.github/scripts/scheduled_maintain.py`: multi-instance maintenance runner (GitHub Actions)
 - `.github/scripts/feishu_notify.py`: Feishu card notification sender
 
 ## Contributing

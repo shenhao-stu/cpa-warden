@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -53,8 +54,16 @@ SUB2API_PG_DSN = os.environ.get("SUB2API_PG_DSN", "")
 # Backup directory for pre-cleanup snapshots (one per day)
 BACKUP_DIR = os.environ.get("BACKUP_DIR", str(Path(__file__).resolve().parent.parent / "backups"))
 
-# Which upstream API status codes trigger account deletion (in addition to 401).
-DELETE_STATUSES = {401, 403, 500, 502, 503}
+# Which upstream API status codes trigger account DELETION (permanent, unrecoverable).
+# 401 is NOT here — it means token expired, recoverable via refresh_token.
+# 500/502/503 are temporary server errors, NOT account problems.
+DELETE_STATUSES = {403}
+
+# Status codes that should trigger DISABLE (temporary, may recover via refresh).
+DISABLE_STATUSES = {401}
+
+# Maximum percentage of accounts that can be deleted in a single run (safety valve).
+MAX_DELETE_RATIO = 0.30  # Abort if >30% of accounts would be deleted
 
 
 def utc_now() -> str:
@@ -175,7 +184,7 @@ def run_warden_maintain(tmpdir: str, dry_run: bool = False, base_url: str = "", 
         "retries": 2,
         "delete_retries": 2,
         "quota_action": "disable",
-        "delete_401": True,
+        "delete_401": False,  # Never auto-delete 401 — token may be refreshable
         "auto_reenable": True,
         "db_path": db_path,
         "invalid_output": invalid_path,
@@ -377,12 +386,62 @@ def _sub2api_login() -> str:
     return data["data"]["access_token"]
 
 
+def _sub2api_test_account(account_id: int, hdrs: dict) -> str:
+    """Test a sub2api account via the test API (model gpt-5.4).
+
+    Returns:
+      "ok"  — account is healthy (or inconclusive)
+      "401" — token permanently invalidated, should be deleted
+      "429" — weekly quota limit reached, keep the account
+    """
+    import random
+    test_prompts = ["1+1", "hi", "ok?", "2+2", "hello", "thanks", "yes", "no",
+                    "3*3", "good", "fine", "done", "next", "go", "cool"]
+    base = SUB2API_URL.rstrip("/")
+    try:
+        resp = requests.post(
+            f"{base}/api/v1/admin/accounts/{account_id}/test",
+            headers=hdrs,
+            json={"model_id": "gpt-5.4", "prompt": random.choice(test_prompts)},
+            timeout=60,
+        )
+        body = resp.text
+        for raw_line in body.splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            if raw_line.startswith("data: "):
+                raw_line = raw_line[6:]
+            elif raw_line.startswith("data:"):
+                raw_line = raw_line[5:]
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "error":
+                error_msg = event.get("error", "")
+                if re.search(r'"status"\s*:\s*401', error_msg) or \
+                   re.search(r'API returned 401', error_msg) or \
+                   "token_invalidated" in error_msg:
+                    return "401"
+                if re.search(r'"status"\s*:\s*429', error_msg) or \
+                   re.search(r'API returned 429', error_msg):
+                    return "429"
+                return "ok"  # other errors — don't delete
+        return "ok"  # no error events = healthy
+    except Exception:
+        return "ok"  # network error — don't delete on uncertainty
+
+
 def maintain_sub2api(dry_run: bool = False) -> dict:
     """Health-check and cleanup codex (openai oauth) accounts on sub2api.
 
     Two-phase approach:
       1. Cross-reference: delete sub2api accounts whose emails are NOT in any CPA instance
-      2. Proxy probe: if proxy available, directly probe remaining accounts via wham/usage
+      2. Test API probe: test remaining accounts via sub2api test endpoint (model gpt-5.4)
+         - 401 (token_invalidated) → DELETE
+         - 429 (weekly quota limit) → KEEP
+    Only processes openai/oauth accounts in "codex free" group.
     Returns stats dict.
     """
     if not SUB2API_URL or not SUB2API_ADMIN_EMAIL or not SUB2API_ADMIN_PASSWORD:
@@ -408,11 +467,16 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
         print(f"  [Sub2API] List accounts failed: {e}")
         return {"error": str(e)}
 
-    codex_accounts = [a for a in all_accounts if a.get("platform") == "openai" and a.get("type") == "oauth"]
-    print(f"  [Sub2API] Total accounts: {len(all_accounts)}, Codex (openai/oauth): {len(codex_accounts)}")
+    codex_accounts = [
+        a for a in all_accounts
+        if a.get("platform") == "openai" and a.get("type") == "oauth"
+        and any(g.get("name") == "codex free" for g in a.get("groups", []))
+    ]
+    print(f"  [Sub2API] Total accounts: {len(all_accounts)}, Codex free (openai/oauth): {len(codex_accounts)}")
 
     if not codex_accounts:
-        return {"total": len(all_accounts), "codex": 0, "cross_ref_deleted": 0, "probe_deleted": 0, "deleted_ok": 0, "deleted_fail": 0}
+        return {"total": len(all_accounts), "codex": 0, "cross_ref_deleted": 0,
+                "test_deleted": 0, "quota_skipped": 0, "deleted_ok": 0, "deleted_fail": 0}
 
     # --- Phase 1: Cross-reference with CPA active emails ---
     cpa_urls = [u.strip() for u in CPA_BASE_URL.split(",") if u.strip()]
@@ -444,48 +508,35 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
         else:
             remaining_accounts.append(acct)
 
-    print(f"  [Sub2API] Stale (not in CPA): {len(stale_accounts)}, remaining for probe: {len(remaining_accounts)}")
+    print(f"  [Sub2API] Stale (not in CPA): {len(stale_accounts)}, remaining for test: {len(remaining_accounts)}")
 
-    # --- Phase 2: Proxy-based probing for remaining accounts ---
-    proxy_url = os.environ.get("PROBE_PROXY", "http://127.0.0.1:20171")
-    proxies = {"https": proxy_url, "http": proxy_url}
-    use_proxy = False
-    try:
-        requests.get("https://chatgpt.com", proxies=proxies, timeout=5)
-        use_proxy = True
-        print(f"  [Sub2API] Using proxy {proxy_url} for probing")
-    except Exception:
-        print(f"  [Sub2API] Proxy {proxy_url} not available, skipping probe phase")
+    # --- Phase 2: Test API probe (gpt-5.4) for remaining accounts ---
+    # Uses sub2api's own test endpoint — no proxy needed, no direct chatgpt.com access
+    test_error_accounts = []
+    quota_skipped = 0
+    for acct in remaining_accounts:
+        acct_id = acct.get("id")
+        acct_name = acct.get("name", str(acct_id))
+        if not acct_id:
+            continue
+        result = _sub2api_test_account(acct_id, hdrs)
+        if result == "401":
+            test_error_accounts.append({"id": acct_id, "name": acct_name, "reason": "test_401"})
+            print(f"    [Test] {acct_name}: 401 token_invalidated → will delete")
+        elif result == "429":
+            quota_skipped += 1
+            print(f"    [Test] {acct_name}: 429 quota limit → keeping")
 
-    probe_error_accounts = []
-    if use_proxy and remaining_accounts:
-        for acct in remaining_accounts:
-            creds = acct.get("credentials", {})
-            access_token = creds.get("access_token", "")
-            if not access_token:
-                continue
-            try:
-                probe_resp = requests.get(
-                    "https://chatgpt.com/backend-api/wham/usage",
-                    headers={
-                        "Authorization": f"Bearer {access_token}",
-                        "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
-                    },
-                    proxies=proxies, timeout=20,
-                )
-                if probe_resp.status_code in DELETE_STATUSES:
-                    probe_error_accounts.append({"id": acct["id"], "name": acct.get("name", ""), "reason": f"probe_{probe_resp.status_code}"})
-            except Exception:
-                pass
-        print(f"  [Sub2API] Probed {len(remaining_accounts)}, found {len(probe_error_accounts)} invalid")
+    print(f"  [Sub2API] Tested {len(remaining_accounts)}: "
+          f"{len(test_error_accounts)} invalidated (401), {quota_skipped} quota-limited (429)")
 
     # --- Delete all identified accounts ---
-    all_to_delete = stale_accounts + probe_error_accounts
+    all_to_delete = stale_accounts + test_error_accounts
 
     if dry_run:
         return {"total": len(all_accounts), "codex": len(codex_accounts),
-                "cross_ref_deleted": len(stale_accounts), "probe_deleted": len(probe_error_accounts),
-                "deleted_ok": 0, "deleted_fail": 0}
+                "cross_ref_deleted": len(stale_accounts), "test_deleted": len(test_error_accounts),
+                "quota_skipped": quota_skipped, "deleted_ok": 0, "deleted_fail": 0}
 
     deleted_ok, deleted_fail = 0, 0
     for ea in all_to_delete:
@@ -505,7 +556,8 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
         "total": len(all_accounts),
         "codex": len(codex_accounts),
         "cross_ref_deleted": len(stale_accounts),
-        "probe_deleted": len(probe_error_accounts),
+        "test_deleted": len(test_error_accounts),
+        "quota_skipped": quota_skipped,
         "deleted_ok": deleted_ok,
         "deleted_fail": deleted_fail,
     }
@@ -569,21 +621,23 @@ def sync_validated_accounts(dry_run: bool = False) -> dict:
                         if pr.status_code == 200:
                             pr_data = pr.json()
                             status = pr_data.get("status_code", 0)
-                            if status in DELETE_STATUSES:
+                            if status in DELETE_STATUSES:  # Only 403 (permanent)
                                 invalid_names.append(name)
                                 continue
+                            # 401 = token expired, don't delete — just skip validation
+                            # 500/502/503 = temporary, trust CPA's active status
                     except Exception:
                         pass
-                # If we can't probe (missing fields), trust the CPA's active status
+                # If we can't probe or probe returned 401/5xx, trust the CPA's active status
                 validated.append(af)
 
-            # Delete invalidated accounts
+            # Delete only truly invalid accounts (403)
             for inv_name in invalid_names:
                 if not dry_run:
                     encoded = urllib.parse.quote(inv_name, safe="")
                     requests.delete(f"{url.rstrip('/')}/v0/management/auth-files?name={encoded}", headers=hdrs, timeout=15)
             if invalid_names:
-                print(f"  [Sync] {url}: validated {len(validated)}, removed {len(invalid_names)} invalid")
+                print(f"  [Sync] {url}: validated {len(validated)}, removed {len(invalid_names)} invalid (403 only)")
 
             names = {f.get("name", "") for f in validated if f.get("name")}
             emails = {(f.get("email") or f.get("account") or "").lower().strip() for f in validated}
@@ -694,6 +748,7 @@ def sync_validated_accounts(dry_run: bool = False) -> dict:
                             "name": email,
                             "platform": "openai",
                             "type": "oauth",
+                            "group_ids": [4],  # codex free
                             "credentials": {
                                 "access_token": auth_data.get("access_token", ""),
                                 "refresh_token": auth_data.get("refresh_token", ""),
@@ -733,9 +788,14 @@ def sync_validated_accounts(dry_run: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 
 def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False, base_url: str = "", token: str = "") -> dict:
-    """Probe accounts for 5xx/error statuses and delete them via CPA API.
+    """Probe accounts and handle errors:
+      - 401: DISABLE only (token expired, may have refresh_token)
+      - 403: DELETE (permanently forbidden)
+      - 500/502/503: SKIP (temporary server errors)
 
-    Returns {"probed": N, "deleted_ok": N, "deleted_fail": N, "names": [...]}.
+    Safety valve: abort deletion if >MAX_DELETE_RATIO of accounts would be affected.
+
+    Returns {"probed": N, "deleted_ok": N, "deleted_fail": N, "disabled_ok": N, "names": [...]}.
     """
     _url = (base_url or CPA_BASE_URL).rstrip("/")
     _tok = token or CPA_TOKEN
@@ -746,7 +806,10 @@ def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False
         if f.get("type", "") == "codex" and not f.get("disabled", False)
     ]
 
-    error_accounts = []
+    to_delete = []   # 403: permanently forbidden
+    to_disable = []  # 401: token expired
+    skipped_5xx = 0  # 500/502/503: temporary server errors
+
     for af in candidates:
         name = af.get("name", "")
         if not name:
@@ -758,7 +821,6 @@ def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False
         }
         try:
             resp = requests.post(f"{_url}/v0/management/api-call", headers=hdrs, json=payload, timeout=20)
-            # CPA api-call returns HTTP 200 with upstream status in JSON body
             upstream_status = resp.status_code
             if resp.status_code == 200:
                 try:
@@ -766,19 +828,49 @@ def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False
                     upstream_status = data.get("status_code", resp.status_code)
                 except Exception:
                     pass
-            if upstream_status in DELETE_STATUSES:
-                error_accounts.append({"name": name, "status": upstream_status})
+            if upstream_status in DELETE_STATUSES:  # {403}
+                to_delete.append({"name": name, "status": upstream_status})
+            elif upstream_status in DISABLE_STATUSES:  # {401}
+                to_disable.append({"name": name, "status": upstream_status})
+            elif upstream_status in {500, 502, 503}:
+                skipped_5xx += 1
         except Exception:
             pass
 
-    print(f"    Probed {len(candidates)}, found {len(error_accounts)} errors")
+    print(f"    Probed {len(candidates)}: {len(to_delete)} to delete (403), "
+          f"{len(to_disable)} to disable (401), {skipped_5xx} skipped (5xx)")
+
+    # Safety valve: abort DELETION if too many accounts would be deleted
+    if candidates and len(to_delete) > 0 and len(to_delete) / len(candidates) > MAX_DELETE_RATIO:
+        print(f"    SAFETY VALVE: {len(to_delete)}/{len(candidates)} ({len(to_delete)/len(candidates):.0%}) "
+              f"deletions exceeds {MAX_DELETE_RATIO:.0%} threshold, aborting deletions")
+        to_delete = []
+    # Separate safety for disables (higher threshold since 401 is common during key rotation)
+    if candidates and len(to_disable) > 0 and len(to_disable) / len(candidates) > 0.50:
+        print(f"    SAFETY VALVE: {len(to_disable)}/{len(candidates)} ({len(to_disable)/len(candidates):.0%}) "
+              f"disables exceeds 50% threshold, aborting disables")
+        to_disable = []
 
     if dry_run:
-        return {"probed": len(candidates), "deleted_ok": 0, "deleted_fail": 0, "names": []}
+        return {"probed": len(candidates), "deleted_ok": 0, "deleted_fail": 0,
+                "disabled_ok": 0, "names": []}
 
+    # Disable 401 accounts (not delete — they may recover via refresh_token)
+    disabled_ok = 0
+    for ea in to_disable:
+        try:
+            resp = requests.patch(
+                f"{_url}/v0/management/auth-files/status",
+                headers=hdrs, json={"name": ea["name"], "disabled": True}, timeout=15)
+            if resp.status_code == 200:
+                disabled_ok += 1
+        except Exception:
+            pass
+
+    # Delete only truly invalid accounts (403)
     deleted_ok, deleted_fail = 0, 0
     deleted_names = []
-    for ea in error_accounts:
+    for ea in to_delete:
         encoded = urllib.parse.quote(ea["name"], safe="")
         try:
             resp = requests.delete(f"{_url}/v0/management/auth-files?name={encoded}", headers=hdrs, timeout=15)
@@ -790,7 +882,8 @@ def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False
         except Exception:
             deleted_fail += 1
 
-    return {"probed": len(candidates), "deleted_ok": deleted_ok, "deleted_fail": deleted_fail, "names": deleted_names}
+    return {"probed": len(candidates), "deleted_ok": deleted_ok, "deleted_fail": deleted_fail,
+            "disabled_ok": disabled_ok, "names": deleted_names}
 
 
 def sync_git_deletions(deleted_names: list[str], dry_run: bool = False) -> dict:
@@ -878,14 +971,15 @@ def send_feishu(warden_stats: dict, error_stats: dict, git_stats: dict, grok_sta
         s2a_del_ok = sub2api_stats.get("deleted_ok", 0)
         s2a_del_fail = sub2api_stats.get("deleted_fail", 0)
         s2a_xref = sub2api_stats.get("cross_ref_deleted", 0)
-        s2a_probe = sub2api_stats.get("probe_deleted", 0)
+        s2a_test = sub2api_stats.get("test_deleted", 0)
+        s2a_quota = sub2api_stats.get("quota_skipped", 0)
         if s2a_del_fail > 0:
             all_ok = False
         lines.extend([
             f"━━━━━━━━━━━━━━━━━━━━",
             f"📍 Sub2API — Codex Cleanup ({SUB2API_URL})",
             f"   📦 Total: {sub2api_stats.get('total', 0)}  |  🎯 Codex: {sub2api_stats.get('codex', 0)}",
-            f"   🔗 Cross-ref stale: {s2a_xref}  |  🔍 Probe invalid: {s2a_probe}",
+            f"   🔗 Cross-ref stale: {s2a_xref}  |  🚫 Test 401: {s2a_test}  |  ⏸️ Quota 429: {s2a_quota}",
             f"   🗑️ Deleted: ✅ {s2a_del_ok}  ❌ {s2a_del_fail}",
         ])
 

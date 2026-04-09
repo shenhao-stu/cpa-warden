@@ -2574,8 +2574,17 @@ async def run_maintain_async(conn: sqlite3.Connection, settings: dict[str, Any])
 
     if settings["delete_401"] and invalid_records:
         names = [row["name"] for row in invalid_records if row.get("name")]
-        LOGGER.info("待删除 401 账号: %s", len(names))
-        if confirm_action(f"即将删除 {len(names)} 个 401 账号", settings["assume_yes"]):
+        total_candidates = len(scan_result.get("candidate_records", []))
+        # Safety valve: abort if >30% of accounts would be deleted
+        if total_candidates and len(names) / total_candidates > 0.30:
+            LOGGER.warning(
+                "安全阀触发: %d/%d (%.0f%%) 账号标记为 401，超过 30%% 阈值，跳过删除",
+                len(names), total_candidates, 100 * len(names) / total_candidates,
+            )
+            names = []
+        if names:
+            LOGGER.info("待删除 401 账号: %s", len(names))
+        if names and confirm_action(f"即将删除 {len(names)} 个 401 账号", settings["assume_yes"]):
             delete_401_results = await run_action_group_async(
                 base_url=settings["base_url"],
                 token=settings["token"],

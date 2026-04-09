@@ -70,7 +70,7 @@ def run_instance(instance: dict) -> dict:
             "timeout": 20,
             "retries": 2,
             "quota_action": "disable",
-            "delete_401": True,
+            "delete_401": False,  # Never auto-delete 401 — token may be refreshable
             "auto_reenable": True,
             "db_path": db_path,
             "invalid_output": invalid_path,
@@ -287,12 +287,63 @@ def maintain_grok_tokens() -> dict | None:
     }
 
 
+def _sub2api_test_account(account_id: int, base_url: str, hdrs: dict) -> str:
+    """Test a sub2api account via the test API (model gpt-5.4).
+
+    Returns:
+      "ok"  — account is healthy (or inconclusive)
+      "401" — token permanently invalidated, should be deleted
+      "429" — weekly quota limit reached, keep the account
+    """
+    import random
+    import re
+    import requests
+    test_prompts = ["1+1", "hi", "ok?", "2+2", "hello", "thanks", "yes", "no",
+                    "3*3", "good", "fine", "done", "next", "go", "cool"]
+    try:
+        resp = requests.post(
+            f"{base_url}/api/v1/admin/accounts/{account_id}/test",
+            headers=hdrs,
+            json={"model_id": "gpt-5.4", "prompt": random.choice(test_prompts)},
+            timeout=60,
+        )
+        body = resp.text
+        for raw_line in body.splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            if raw_line.startswith("data: "):
+                raw_line = raw_line[6:]
+            elif raw_line.startswith("data:"):
+                raw_line = raw_line[5:]
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "error":
+                error_msg = event.get("error", "")
+                if re.search(r'"status"\s*:\s*401', error_msg) or \
+                   re.search(r'API returned 401', error_msg) or \
+                   "token_invalidated" in error_msg:
+                    return "401"
+                if re.search(r'"status"\s*:\s*429', error_msg) or \
+                   re.search(r'API returned 429', error_msg):
+                    return "429"
+                return "ok"  # other errors — don't delete
+        return "ok"  # no error events = healthy
+    except Exception:
+        return "ok"  # network error — don't delete on uncertainty
+
+
 def maintain_sub2api() -> dict | None:
     """Health-check and cleanup codex (openai/oauth) accounts on sub2api.
 
-    Two-phase approach (CI version — GitHub runners can reach chatgpt.com directly):
+    Two-phase approach:
       1. Cross-reference: delete sub2api accounts not in any CPA instance
-      2. Direct probe: check remaining accounts via wham/usage
+      2. Test API probe: test remaining accounts via sub2api test endpoint (model gpt-5.4)
+         - 401 (token_invalidated) → DELETE
+         - 429 (weekly quota limit) → KEEP
+    Only processes openai/oauth accounts in "codex free" group.
     Returns stats dict or None if not configured.
     """
     base_url = os.environ.get("SUB2API_URL", "")
@@ -324,10 +375,15 @@ def maintain_sub2api() -> dict | None:
     resp.raise_for_status()
     all_accounts = resp.json().get("data", {}).get("items", [])
 
-    codex_accounts = [a for a in all_accounts if a.get("platform") == "openai" and a.get("type") == "oauth"]
+    codex_accounts = [
+        a for a in all_accounts
+        if a.get("platform") == "openai" and a.get("type") == "oauth"
+        and any(g.get("name") == "codex free" for g in a.get("groups", []))
+    ]
 
     if not codex_accounts:
-        return {"total": len(all_accounts), "codex": 0, "cross_ref_deleted": 0, "probe_deleted": 0, "deleted_ok": 0, "deleted_fail": 0}
+        return {"total": len(all_accounts), "codex": 0, "cross_ref_deleted": 0,
+                "test_deleted": 0, "quota_skipped": 0, "deleted_ok": 0, "deleted_fail": 0}
 
     # --- Phase 1: Cross-reference with CPA ---
     raw_instances = os.environ.get("CPA_INSTANCES", "")
@@ -361,36 +417,27 @@ def maintain_sub2api() -> dict | None:
         else:
             remaining_accounts.append(acct)
 
-    # --- Phase 2: Direct probe (GitHub runners not Cloudflare-blocked) ---
-    delete_statuses = {401, 403, 500, 502, 503}
-    probe_error_accounts = []
-    probe_timeout_count = 0
+    # --- Phase 2: Test API probe (gpt-5.4) for remaining accounts ---
+    # Uses sub2api's own test endpoint — no direct chatgpt.com access needed
+    test_error_accounts = []
+    quota_skipped = 0
     for acct in remaining_accounts:
-        creds = acct.get("credentials", {})
-        access_token = creds.get("access_token", "")
-        if not access_token:
+        acct_id = acct.get("id")
+        acct_name = acct.get("name", str(acct_id))
+        if not acct_id:
             continue
-        try:
-            probe_resp = requests.get(
-                "https://chatgpt.com/backend-api/wham/usage",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
-                },
-                timeout=20,
-            )
-            if probe_resp.status_code in delete_statuses:
-                probe_error_accounts.append({"id": acct["id"], "name": acct.get("name", ""), "reason": f"probe_{probe_resp.status_code}"})
-        except requests.exceptions.Timeout:
-            probe_timeout_count += 1
-        except Exception:
-            pass
+        result = _sub2api_test_account(acct_id, base_url, hdrs)
+        if result == "401":
+            test_error_accounts.append({"id": acct_id, "name": acct_name, "reason": "test_401"})
+            print(f"    [Test] {acct_name}: 401 token_invalidated")
+        elif result == "429":
+            quota_skipped += 1
 
-    if probe_timeout_count > 0:
-        print(f"  Sub2API probe: {probe_timeout_count} timeouts")
+    print(f"  Sub2API tested {len(remaining_accounts)}: "
+          f"{len(test_error_accounts)} invalidated (401), {quota_skipped} quota-limited (429)")
 
     # --- Delete ---
-    all_to_delete = stale_accounts + probe_error_accounts
+    all_to_delete = stale_accounts + test_error_accounts
     deleted_ok, deleted_fail = 0, 0
     for ea in all_to_delete:
         try:
@@ -406,7 +453,8 @@ def maintain_sub2api() -> dict | None:
         "total": len(all_accounts),
         "codex": len(codex_accounts),
         "cross_ref_deleted": len(stale_accounts),
-        "probe_deleted": len(probe_error_accounts),
+        "test_deleted": len(test_error_accounts),
+        "quota_skipped": quota_skipped,
         "deleted_ok": deleted_ok,
         "deleted_fail": deleted_fail,
     }
@@ -481,7 +529,7 @@ def main() -> int:
             sub2api_result = maintain_sub2api()
             if sub2api_result:
                 print(f"  Total: {sub2api_result['total']} | Codex: {sub2api_result['codex']}")
-                print(f"  Probed: {sub2api_result['probed']} | Deleted: ok={sub2api_result['deleted_ok']} fail={sub2api_result['deleted_fail']}")
+                print(f"  Cross-ref: {sub2api_result.get('cross_ref_deleted', 0)} | Test 401: {sub2api_result.get('test_deleted', 0)} | Quota 429: {sub2api_result.get('quota_skipped', 0)} | ok={sub2api_result['deleted_ok']} fail={sub2api_result['deleted_fail']}")
         except Exception as exc:
             print(f"  Sub2API maintenance failed: {exc}")
 

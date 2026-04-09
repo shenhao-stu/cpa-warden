@@ -11,3 +11,6 @@ cpa_warden_401_accounts.json
 cpa_warden_quota_accounts.json
 *.log
 backups/
+refs/
+sub2api_standalone/
+sub2api_standalone.zip
