@@ -49,6 +49,7 @@ DEFAULT_TIMEOUT = 15
 DEFAULT_RETRIES = 3
 DEFAULT_DELETE_RETRIES = 2
 DEFAULT_QUOTA_ACTION = "disable"
+DEFAULT_QUOTA_SKIP_PLAN_TYPES: list[str] = []
 DEFAULT_DELETE_401 = True
 DEFAULT_AUTO_REENABLE = True
 DEFAULT_REENABLE_SCOPE = "signal"
@@ -528,6 +529,11 @@ def build_settings(args: argparse.Namespace, conf: dict[str, Any]) -> dict[str, 
             else config_lookup(conf, "delete_retries", "action_retries", default=DEFAULT_DELETE_RETRIES)
         ),
         "quota_action": quota_action,
+        "quota_skip_plan_types": [
+            str(p).strip().lower()
+            for p in (config_lookup(conf, "quota_skip_plan_types", default=DEFAULT_QUOTA_SKIP_PLAN_TYPES) or [])
+            if str(p).strip()
+        ],
         "quota_disable_threshold": float(
             args.quota_disable_threshold
             if args.quota_disable_threshold is not None
@@ -2566,6 +2572,17 @@ async def run_maintain_async(conn: sqlite3.Connection, settings: dict[str, Any])
     }
     invalid_records = scan_result["invalid_records"]
     quota_records = [row for row in scan_result["quota_records"] if row.get("is_invalid_401") != 1]
+    skip_plans = set(settings.get("quota_skip_plan_types") or [])
+    if skip_plans:
+        before_count = len(quota_records)
+        quota_records = [
+            row for row in quota_records
+            if str(row.get("usage_plan_type") or row.get("id_token_plan_type") or "").strip().lower()
+            not in skip_plans
+        ]
+        skipped = before_count - len(quota_records)
+        if skipped:
+            LOGGER.info("跳过限额处理（plan_type ∈ %s）: %s", sorted(skip_plans), skipped)
     recovered_records = scan_result["recovered_records"]
 
     delete_401_results: list[dict[str, Any]] = []

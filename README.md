@@ -430,6 +430,8 @@ on:
 - `config.example.json`: example configuration
 - `pyproject.toml`: project metadata and dependencies
 - `scripts/daily-maintain.py`: local daily maintenance (multi-CPA + grok + sub2api + Git sync + Feishu)
+- `scripts/purge_free_accounts.py`: one-shot mass purge of `free` codex accounts, with credentialed backups for later restoration (never touches `team`, never touches sub2api anthropic/codex-team groups)
+- `scripts/restore_free_accounts.py`: companion to re-upload free codex accounts from a purge backup directory
 - `web/`: browser-based dashboard (HTML/CSS/JS)
 - `.github/workflows/ci.yml`: basic CI checks
 - `.github/workflows/pages.yml`: GitHub Pages deployment

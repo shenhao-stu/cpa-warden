@@ -156,12 +156,15 @@ def build_card(result_data: dict | None, scan_status: str) -> dict:
         s2a_dedup = sub2api.get('dedup_deleted', 0)
         s2a_xref = sub2api.get('cross_ref_deleted', 0)
         s2a_test = sub2api.get('test_deleted', 0)
-        s2a_quota = sub2api.get('quota_skipped', 0)
+        s2a_disable = sub2api.get('quota_disabled', 0)
+        s2a_disable_fail = sub2api.get('quota_disable_fail', 0)
+        s2a_reenable = sub2api.get('reenabled', 0)
         s2a_lines = [
             "🔗 Sub2API Codex Cleanup",
             f"━━━━━━━━━━━━━━━━━━━━",
             f"   📦 Total: {sub2api.get('total', 0)}  |  🎯 Codex: {sub2api.get('codex', 0)}",
-            f"   🔄 Dedup: {s2a_dedup}  |  🔗 Stale: {s2a_xref}  |  🚫 401: {s2a_test}  |  ⏸️ 429: {s2a_quota}",
+            f"   🔄 Dedup: {s2a_dedup}  |  🔗 Stale: {s2a_xref}  |  🚫 401: {s2a_test}",
+            f"   ⏸️ Disabled (429): ✅ {s2a_disable}  ❌ {s2a_disable_fail}  |  ▶️ Re-enabled: {s2a_reenable}",
             f"   🗑️ Deleted: ✅ {sub2api.get('deleted_ok', 0)}  ❌ {sub2api.get('deleted_fail', 0)}",
             f"━━━━━━━━━━━━━━━━━━━━",
         ]

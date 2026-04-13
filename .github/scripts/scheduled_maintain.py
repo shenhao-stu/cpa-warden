@@ -70,7 +70,8 @@ def run_instance(instance: dict) -> dict:
             "timeout": 20,
             "retries": 2,
             "quota_action": "disable",
-            "delete_401": False,  # Never auto-delete 401 — token may be refreshable
+            "quota_skip_plan_types": ["team"],  # Never disable team plans on 429
+            "delete_401": True,  # 401 now means token_invalidated → delete
             "auto_reenable": True,
             "db_path": db_path,
             "invalid_output": invalid_path,
@@ -287,13 +288,28 @@ def maintain_grok_tokens() -> dict | None:
     }
 
 
+def _sub2api_set_status(account_id: int, status: str, base_url: str, hdrs: dict) -> bool:
+    """Set sub2api account status (active/inactive). Returns True on success."""
+    import requests
+    try:
+        resp = requests.put(
+            f"{base_url}/api/v1/admin/accounts/{account_id}",
+            headers=hdrs,
+            json={"status": status},
+            timeout=15,
+        )
+        return resp.status_code == 200 and resp.json().get("code") == 0
+    except Exception:
+        return False
+
+
 def _sub2api_test_account(account_id: int, base_url: str, hdrs: dict) -> str:
     """Test a sub2api account via the test API (model gpt-5.4).
 
     Returns:
       "ok"  — account is healthy (or inconclusive)
       "401" — token permanently invalidated, should be deleted
-      "429" — weekly quota limit reached, keep the account
+      "429" — weekly quota limit reached, should be disabled
     """
     import random
     import re
@@ -384,15 +400,27 @@ def maintain_sub2api() -> dict | None:
             break
         page += 1
 
+    # Include both codex free AND codex team openai/oauth accounts.
+    # Anthropic and any other groups are NEVER touched.
+    def _account_group_name(a: dict) -> str:
+        for g in a.get("groups", []):
+            gn = str(g.get("name") or "").lower().strip()
+            if gn in {"codex free", "codex team"}:
+                return gn
+        return ""
+
     codex_accounts = [
         a for a in all_accounts
         if a.get("platform") == "openai" and a.get("type") == "oauth"
-        and any(g.get("name") == "codex free" for g in a.get("groups", []))
+        and _account_group_name(a) in {"codex free", "codex team"}
     ]
+    free_count = sum(1 for a in codex_accounts if _account_group_name(a) == "codex free")
+    team_count = sum(1 for a in codex_accounts if _account_group_name(a) == "codex team")
+    print(f"  Sub2API total: {len(all_accounts)}, codex free: {free_count}, codex team: {team_count}")
 
     if not codex_accounts:
         return {"total": len(all_accounts), "codex": 0, "dedup_deleted": 0, "cross_ref_deleted": 0,
-                "test_deleted": 0, "quota_skipped": 0, "deleted_ok": 0, "deleted_fail": 0}
+                "test_deleted": 0, "quota_disabled": 0, "reenabled": 0, "deleted_ok": 0, "deleted_fail": 0}
 
     # --- Phase 0: Deduplicate — keep newest (highest id) per name, delete rest ---
     from collections import defaultdict
@@ -427,7 +455,18 @@ def maintain_sub2api() -> dict | None:
 
     codex_accounts = deduplicated_accounts
 
-    # --- Phase 1: Cross-reference with CPA ---
+    # --- Phase 1: Status sweep — accounts already 401 in their stored status ---
+    status_401_to_delete: list = []
+    for acct in codex_accounts:
+        if acct.get("status") == "error":
+            err = str(acct.get("error_message") or "")
+            if "token_invalidated" in err or '"status": 401' in err or '"status":401' in err:
+                status_401_to_delete.append({
+                    "id": acct["id"], "name": acct.get("name", ""), "reason": "status_401",
+                })
+    print(f"  Sub2API status sweep: {len(status_401_to_delete)} accounts already in 401 error state")
+
+    # --- Phase 2: Cross-reference with CPA ---
     raw_instances = os.environ.get("CPA_INSTANCES", "")
     cpa_active_emails: set = set()
     if raw_instances:
@@ -450,36 +489,52 @@ def maintain_sub2api() -> dict | None:
         except json.JSONDecodeError:
             pass
 
+    phase1_ids = {ea["id"] for ea in status_401_to_delete}
     stale_accounts = []
     remaining_accounts = []
     for acct in codex_accounts:
+        if acct.get("id") in phase1_ids:
+            continue
         acct_email = (acct.get("name") or "").lower().strip()
-        if cpa_active_emails and acct_email and acct_email not in cpa_active_emails:
+        grp = _account_group_name(acct)
+        # Only cross-reference "codex free" with CPA — team accounts may live only in sub2api
+        if grp == "codex free" and cpa_active_emails and acct_email and acct_email not in cpa_active_emails:
             stale_accounts.append({"id": acct["id"], "name": acct.get("name", ""), "reason": "not_in_cpa"})
         else:
             remaining_accounts.append(acct)
 
-    # --- Phase 2: Test API probe (gpt-5.4) for remaining accounts ---
-    # Uses sub2api's own test endpoint — no direct chatgpt.com access needed
-    test_error_accounts = []
-    quota_skipped = 0
+    # --- Phase 3: Test API probe (gpt-5.4) for remaining accounts ---
+    # Team 401 → delete. Team 429 → skip (auto-resets). Free 401 → delete. Free 429 → disable.
+    test_401_accounts: list = []
+    test_429_accounts: list = []
+    test_ok_accounts: list = []
     for acct in remaining_accounts:
         acct_id = acct.get("id")
         acct_name = acct.get("name", str(acct_id))
         if not acct_id:
             continue
+        grp = _account_group_name(acct)
         result = _sub2api_test_account(acct_id, base_url, hdrs)
+        cur_status = acct.get("status", "")
         if result == "401":
-            test_error_accounts.append({"id": acct_id, "name": acct_name, "reason": "test_401"})
-            print(f"    [Test] {acct_name}: 401 token_invalidated")
+            test_401_accounts.append({"id": acct_id, "name": acct_name, "reason": "test_401", "group": grp})
+            print(f"    [Test] {acct_name} ({grp}): 401 token_invalidated")
         elif result == "429":
-            quota_skipped += 1
+            if grp == "codex team":
+                print(f"    [Test] {acct_name} (team): 429 → skip (auto-resets)")
+            elif cur_status != "inactive":
+                test_429_accounts.append({"id": acct_id, "name": acct_name, "reason": "test_429"})
+                print(f"    [Test] {acct_name} (free): 429 → will disable")
+        else:
+            if cur_status == "inactive":
+                test_ok_accounts.append({"id": acct_id, "name": acct_name, "reason": "recovered"})
 
     print(f"  Sub2API tested {len(remaining_accounts)}: "
-          f"{len(test_error_accounts)} invalidated (401), {quota_skipped} quota-limited (429)")
+          f"401={len(test_401_accounts)} 429={len(test_429_accounts)} "
+          f"recoverable={len(test_ok_accounts)}")
 
-    # --- Delete ---
-    all_to_delete = stale_accounts + test_error_accounts
+    # --- Apply actions ---
+    all_to_delete = status_401_to_delete + stale_accounts + test_401_accounts
     deleted_ok, deleted_fail = 0, 0
     for ea in all_to_delete:
         try:
@@ -491,13 +546,27 @@ def maintain_sub2api() -> dict | None:
         except Exception:
             deleted_fail += 1
 
+    disabled_ok, disabled_fail = 0, 0
+    for ea in test_429_accounts:
+        if _sub2api_set_status(ea["id"], "inactive", base_url, hdrs):
+            disabled_ok += 1
+        else:
+            disabled_fail += 1
+
+    reenabled_ok = 0
+    for ea in test_ok_accounts:
+        if _sub2api_set_status(ea["id"], "active", base_url, hdrs):
+            reenabled_ok += 1
+
     return {
         "total": len(all_accounts),
         "codex": len(codex_accounts),
         "dedup_deleted": dedup_deleted_ok,
         "cross_ref_deleted": len(stale_accounts),
-        "test_deleted": len(test_error_accounts),
-        "quota_skipped": quota_skipped,
+        "test_deleted": len(test_401_accounts) + len(status_401_to_delete),
+        "quota_disabled": disabled_ok,
+        "quota_disable_fail": disabled_fail,
+        "reenabled": reenabled_ok,
         "deleted_ok": deleted_ok,
         "deleted_fail": deleted_fail,
     }
@@ -571,8 +640,10 @@ def main() -> int:
         try:
             sub2api_result = maintain_sub2api()
             if sub2api_result:
-                print(f"  Total: {sub2api_result['total']} | Codex: {sub2api_result['codex']}")
-                print(f"  Cross-ref: {sub2api_result.get('cross_ref_deleted', 0)} | Test 401: {sub2api_result.get('test_deleted', 0)} | Quota 429: {sub2api_result.get('quota_skipped', 0)} | ok={sub2api_result['deleted_ok']} fail={sub2api_result['deleted_fail']}")
+                print(f"  Total: {sub2api_result['total']} | Codex free: {sub2api_result['codex']}")
+                print(f"  Dedup: {sub2api_result.get('dedup_deleted', 0)} | Stale: {sub2api_result.get('cross_ref_deleted', 0)} | 401: {sub2api_result.get('test_deleted', 0)}")
+                print(f"  Disabled (429): {sub2api_result.get('quota_disabled', 0)} | Re-enabled: {sub2api_result.get('reenabled', 0)}")
+                print(f"  Deleted: ok={sub2api_result['deleted_ok']} fail={sub2api_result['deleted_fail']}")
         except Exception as exc:
             print(f"  Sub2API maintenance failed: {exc}")
 

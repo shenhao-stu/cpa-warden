@@ -55,12 +55,17 @@ SUB2API_PG_DSN = os.environ.get("SUB2API_PG_DSN", "")
 BACKUP_DIR = os.environ.get("BACKUP_DIR", str(Path(__file__).resolve().parent.parent / "backups"))
 
 # Which upstream API status codes trigger account DELETION (permanent, unrecoverable).
-# 401 is NOT here — it means token expired, recoverable via refresh_token.
+# 401 is now included — CPA already exhausted refresh attempts before surfacing 401,
+#   so an upstream 401 means the token is permanently invalidated (token_invalidated).
 # 500/502/503 are temporary server errors, NOT account problems.
-DELETE_STATUSES = {403}
+DELETE_STATUSES = {401, 403}
 
-# Status codes that should trigger DISABLE (temporary, may recover via refresh).
-DISABLE_STATUSES = {401}
+# Status codes that should trigger DISABLE (temporary, kept around for future use).
+DISABLE_STATUSES: set[int] = set()
+
+# Plan types that should NEVER be disabled when hitting quota (429).
+# Team plans get reset by OpenAI on their schedule, so leave them alone.
+QUOTA_SKIP_PLAN_TYPES = ["team"]
 
 # Maximum percentage of accounts that can be deleted in a single run (safety valve).
 MAX_DELETE_RATIO = 0.30  # Abort if >30% of accounts would be deleted
@@ -186,7 +191,8 @@ def run_warden_maintain(tmpdir: str, dry_run: bool = False, base_url: str = "", 
         "retries": 2,
         "delete_retries": 2,
         "quota_action": "disable",
-        "delete_401": False,  # Never auto-delete 401 — token may be refreshable
+        "quota_skip_plan_types": QUOTA_SKIP_PLAN_TYPES,  # Never disable team plans on 429
+        "delete_401": True,  # 401 now means token_invalidated → delete
         "auto_reenable": True,
         "db_path": db_path,
         "invalid_output": invalid_path,
@@ -388,13 +394,32 @@ def _sub2api_login() -> str:
     return data["data"]["access_token"]
 
 
+def _sub2api_set_status(account_id: int, status: str, hdrs: dict) -> bool:
+    """Set sub2api account status via PUT /api/v1/admin/accounts/{id}.
+
+    `status` should be "active" or "inactive".
+    Returns True on success.
+    """
+    base = SUB2API_URL.rstrip("/")
+    try:
+        resp = requests.put(
+            f"{base}/api/v1/admin/accounts/{account_id}",
+            headers=hdrs,
+            json={"status": status},
+            timeout=15,
+        )
+        return resp.status_code == 200 and resp.json().get("code") == 0
+    except Exception:
+        return False
+
+
 def _sub2api_test_account(account_id: int, hdrs: dict) -> str:
     """Test a sub2api account via the test API (model gpt-5.4).
 
     Returns:
       "ok"  — account is healthy (or inconclusive)
       "401" — token permanently invalidated, should be deleted
-      "429" — weekly quota limit reached, keep the account
+      "429" — weekly quota limit reached, should be disabled
     """
     import random
     test_prompts = ["1+1", "hi", "ok?", "2+2", "hello", "thanks", "yes", "no",
@@ -438,12 +463,18 @@ def _sub2api_test_account(account_id: int, hdrs: dict) -> str:
 def maintain_sub2api(dry_run: bool = False) -> dict:
     """Health-check and cleanup codex (openai oauth) accounts on sub2api.
 
-    Two-phase approach:
-      1. Cross-reference: delete sub2api accounts whose emails are NOT in any CPA instance
-      2. Test API probe: test remaining accounts via sub2api test endpoint (model gpt-5.4)
+    Phases:
+      0. Dedup: remove duplicate names, keep newest
+      1. Status sweep: disable already-rate-limited & delete already-401 accounts
+         (uses the account's existing status/error_message — no probe needed)
+      2. Cross-reference: delete sub2api accounts whose emails are NOT in any CPA instance
+      3. Test API probe: test remaining accounts via sub2api test endpoint (gpt-5.4)
          - 401 (token_invalidated) → DELETE
-         - 429 (weekly quota limit) → KEEP
-    Only processes openai/oauth accounts in "codex free" group.
+         - 429 (quota limit reached) → DISABLE (status=inactive)
+      4. Re-enable any active "codex free" account whose status is wrongly inactive
+         (this is intentionally narrow — only re-enable if test reports "ok")
+    Only touches openai/oauth accounts in "codex free" group.
+    "codex team" accounts are NEVER touched.
     Returns stats dict.
     """
     if not SUB2API_URL or not SUB2API_ADMIN_EMAIL or not SUB2API_ADMIN_PASSWORD:
@@ -477,16 +508,28 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
         print(f"  [Sub2API] List accounts failed: {e}")
         return {"error": str(e)}
 
+    # Include both codex free AND codex team openai/oauth accounts.
+    # Anthropic and any other groups are NEVER touched.
+    def _account_group_name(a: dict) -> str:
+        for g in a.get("groups", []):
+            gn = str(g.get("name") or "").lower().strip()
+            if gn in {"codex free", "codex team"}:
+                return gn
+        return ""
+
     codex_accounts = [
         a for a in all_accounts
         if a.get("platform") == "openai" and a.get("type") == "oauth"
-        and any(g.get("name") == "codex free" for g in a.get("groups", []))
+        and _account_group_name(a) in {"codex free", "codex team"}
     ]
-    print(f"  [Sub2API] Total accounts: {len(all_accounts)}, Codex free (openai/oauth): {len(codex_accounts)}")
+    free_count = sum(1 for a in codex_accounts if _account_group_name(a) == "codex free")
+    team_count = sum(1 for a in codex_accounts if _account_group_name(a) == "codex team")
+    print(f"  [Sub2API] Total accounts: {len(all_accounts)}, "
+          f"Codex free: {free_count}, Codex team: {team_count}")
 
     if not codex_accounts:
         return {"total": len(all_accounts), "codex": 0, "dedup_deleted": 0, "cross_ref_deleted": 0,
-                "test_deleted": 0, "quota_skipped": 0, "deleted_ok": 0, "deleted_fail": 0}
+                "test_deleted": 0, "quota_disabled": 0, "reenabled": 0, "deleted_ok": 0, "deleted_fail": 0}
 
     # --- Phase 0: Deduplicate — keep newest (highest id) per name, delete rest ---
     from collections import defaultdict
@@ -527,7 +570,20 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
     # Use deduplicated list for subsequent phases
     codex_accounts = deduplicated_accounts
 
-    # --- Phase 1: Cross-reference with CPA active emails ---
+    # --- Phase 1: Status sweep (no probe needed) ---
+    # Accounts with status=error and 401/token_invalidated in error_message → delete
+    # Accounts already inactive → leave alone (stays disabled)
+    status_401_to_delete: list[dict] = []
+    for acct in codex_accounts:
+        if acct.get("status") == "error":
+            err = str(acct.get("error_message") or "")
+            if "token_invalidated" in err or '"status": 401' in err or '"status":401' in err:
+                status_401_to_delete.append({
+                    "id": acct["id"], "name": acct.get("name", ""), "reason": "status_401",
+                })
+    print(f"  [Sub2API] Status sweep: {len(status_401_to_delete)} accounts already in 401 error state")
+
+    # --- Phase 2: Cross-reference with CPA active emails ---
     cpa_urls = [u.strip() for u in CPA_BASE_URL.split(",") if u.strip()]
     cpa_active_emails: set[str] = set()
     for cpa_url in cpa_urls:
@@ -547,47 +603,71 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
 
     print(f"  [Sub2API] CPA active codex emails: {len(cpa_active_emails)}")
 
-    # Accounts in sub2api but not in any CPA instance → stale, delete
+    # Accounts in sub2api but not in any CPA instance → stale, delete.
+    # Only apply to "codex free" accounts — team accounts may live only in sub2api.
+    # Skip accounts already marked for deletion in Phase 1.
+    phase1_ids = {ea["id"] for ea in status_401_to_delete}
     stale_accounts = []
     remaining_accounts = []
     for acct in codex_accounts:
+        if acct.get("id") in phase1_ids:
+            continue
         acct_email = (acct.get("name") or "").lower().strip()
-        if cpa_active_emails and acct_email and acct_email not in cpa_active_emails:
+        grp = _account_group_name(acct)
+        if grp == "codex free" and cpa_active_emails and acct_email and acct_email not in cpa_active_emails:
             stale_accounts.append({"id": acct["id"], "name": acct.get("name", ""), "reason": "not_in_cpa"})
         else:
             remaining_accounts.append(acct)
 
     print(f"  [Sub2API] Stale (not in CPA): {len(stale_accounts)}, remaining for test: {len(remaining_accounts)}")
 
-    # --- Phase 2: Test API probe (gpt-5.4) for remaining accounts ---
+    # --- Phase 3: Test API probe (gpt-5.4) for remaining accounts ---
     # Uses sub2api's own test endpoint — no proxy needed, no direct chatgpt.com access
-    test_error_accounts = []
-    quota_skipped = 0
+    # Team accounts: only delete 401; their 429 is expected to reset, so leave status alone.
+    # Free accounts: delete 401; disable 429 (free quotas may stay at 0 for a long time).
+    test_401_accounts: list[dict] = []   # delete (free + team)
+    test_429_accounts: list[dict] = []   # disable (free only)
+    test_ok_accounts: list[dict] = []    # candidate for re-enable if currently inactive
     for acct in remaining_accounts:
         acct_id = acct.get("id")
         acct_name = acct.get("name", str(acct_id))
         if not acct_id:
             continue
+        grp = _account_group_name(acct)
         result = _sub2api_test_account(acct_id, hdrs)
+        cur_status = acct.get("status", "")
         if result == "401":
-            test_error_accounts.append({"id": acct_id, "name": acct_name, "reason": "test_401"})
-            print(f"    [Test] {acct_name}: 401 token_invalidated → will delete")
+            test_401_accounts.append({"id": acct_id, "name": acct_name, "reason": "test_401", "group": grp})
+            print(f"    [Test] {acct_name} ({grp}): 401 token_invalidated → will delete")
         elif result == "429":
-            quota_skipped += 1
-            print(f"    [Test] {acct_name}: 429 quota limit → keeping")
+            if grp == "codex team":
+                # Team quota resets automatically — leave it alone
+                print(f"    [Test] {acct_name} (team): 429 quota limit → skip (will auto-reset)")
+            elif cur_status != "inactive":
+                test_429_accounts.append({"id": acct_id, "name": acct_name, "reason": "test_429"})
+                print(f"    [Test] {acct_name} (free): 429 quota limit → will disable")
+        else:
+            # ok — if currently inactive, this is a candidate for re-enable
+            if cur_status == "inactive":
+                test_ok_accounts.append({"id": acct_id, "name": acct_name, "reason": "recovered"})
 
     print(f"  [Sub2API] Tested {len(remaining_accounts)}: "
-          f"{len(test_error_accounts)} invalidated (401), {quota_skipped} quota-limited (429)")
+          f"401={len(test_401_accounts)} 429={len(test_429_accounts)} "
+          f"recoverable={len(test_ok_accounts)}")
 
-    # --- Delete all identified accounts ---
-    all_to_delete = stale_accounts + test_error_accounts
+    # --- Apply actions ---
+    all_to_delete = status_401_to_delete + stale_accounts + test_401_accounts
 
     if dry_run:
         return {"total": len(all_accounts), "codex": len(codex_accounts),
                 "dedup_deleted": len(dedup_to_delete),
-                "cross_ref_deleted": len(stale_accounts), "test_deleted": len(test_error_accounts),
-                "quota_skipped": quota_skipped, "deleted_ok": 0, "deleted_fail": 0}
+                "cross_ref_deleted": len(stale_accounts),
+                "test_deleted": len(test_401_accounts) + len(status_401_to_delete),
+                "quota_disabled": len(test_429_accounts),
+                "reenabled": len(test_ok_accounts),
+                "deleted_ok": 0, "deleted_fail": 0}
 
+    # Delete 401 + stale
     deleted_ok, deleted_fail = 0, 0
     for ea in all_to_delete:
         try:
@@ -601,14 +681,33 @@ def maintain_sub2api(dry_run: bool = False) -> dict:
         except Exception:
             deleted_fail += 1
 
-    print(f"  [Sub2API] Deleted: ok={deleted_ok} fail={deleted_fail}")
+    # Disable 429 (free tier exhausted quota)
+    disabled_ok, disabled_fail = 0, 0
+    for ea in test_429_accounts:
+        if _sub2api_set_status(ea["id"], "inactive", hdrs):
+            disabled_ok += 1
+            print(f"    Disabled (429): {ea['name']}")
+        else:
+            disabled_fail += 1
+
+    # Re-enable any that recovered (inactive → active when test reports ok)
+    reenabled_ok = 0
+    for ea in test_ok_accounts:
+        if _sub2api_set_status(ea["id"], "active", hdrs):
+            reenabled_ok += 1
+            print(f"    Re-enabled: {ea['name']}")
+
+    print(f"  [Sub2API] Deleted: ok={deleted_ok} fail={deleted_fail}  "
+          f"Disabled: ok={disabled_ok} fail={disabled_fail}  Re-enabled: {reenabled_ok}")
     return {
         "total": len(all_accounts),
         "codex": len(codex_accounts),
         "dedup_deleted": dedup_deleted_ok,
         "cross_ref_deleted": len(stale_accounts),
-        "test_deleted": len(test_error_accounts),
-        "quota_skipped": quota_skipped,
+        "test_deleted": len(test_401_accounts) + len(status_401_to_delete),
+        "quota_disabled": disabled_ok,
+        "quota_disable_fail": disabled_fail,
+        "reenabled": reenabled_ok,
         "deleted_ok": deleted_ok,
         "deleted_fail": deleted_fail,
     }
@@ -758,90 +857,16 @@ def sync_validated_accounts(dry_run: bool = False) -> dict:
         print(f"  [Sync] {target_url}: synced {synced}/{len(to_sync)}")
         total_synced_cpa += synced
 
-    # Sync to sub2api: upload CPA accounts not yet in sub2api
-    synced_sub2api = 0
-    if SUB2API_URL and SUB2API_ADMIN_EMAIL and SUB2API_ADMIN_PASSWORD:
-        try:
-            jwt = _sub2api_login()
-            hdrs = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
-            # Paginated listing to avoid missing accounts and creating duplicates
-            s2a_items: list = []
-            s2a_page = 1
-            while True:
-                resp = requests.get(f"{SUB2API_URL.rstrip('/')}/api/v1/admin/accounts?page={s2a_page}&page_size=100", headers=hdrs, timeout=30)
-                resp.raise_for_status()
-                s2a_data = resp.json().get("data", {})
-                page_items = s2a_data.get("items", [])
-                s2a_items.extend(page_items)
-                s2a_total = s2a_data.get("total", 0)
-                if len(s2a_items) >= s2a_total or not page_items:
-                    break
-                s2a_page += 1
-            s2a_emails = {(a.get("name") or "").lower().strip() for a in s2a_items}
-            s2a_emails.discard("")
-
-            # Union of all CPA active emails
-            all_active_emails: set[str] = set()
-            for info in cpa_accounts.values():
-                all_active_emails |= info["emails"]
-
-            missing_emails = all_active_emails - s2a_emails
-            print(f"  [Sync] Sub2API: {len(s2a_items)} existing, {len(missing_emails)} to sync")
-
-            if not dry_run and missing_emails:
-                # Read auth files from GitHub to get access_token for sub2api upload
-                for name in sorted(all_active_names):
-                    if name not in gh_files:
-                        continue
-                    try:
-                        file_url = f"https://api.github.com/repos/{GIT_REPO}/contents/{GIT_AUTH_DIR}/{urllib.parse.quote(name, safe='')}"
-                        resp = requests.get(file_url, headers=gh_headers(), params={"ref": GIT_BRANCH}, timeout=15)
-                        if resp.status_code != 200:
-                            continue
-                        import base64
-                        auth_data = json.loads(base64.b64decode(resp.json()["content"]).decode("utf-8"))
-                        email = (auth_data.get("email") or "").lower().strip()
-                        if email not in missing_emails:
-                            continue
-
-                        # Upload to sub2api
-                        payload = {
-                            "name": email,
-                            "platform": "openai",
-                            "type": "oauth",
-                            "group_ids": [4],  # codex free
-                            "credentials": {
-                                "access_token": auth_data.get("access_token", ""),
-                                "refresh_token": auth_data.get("refresh_token", ""),
-                            },
-                        }
-                        exp_val = auth_data.get("expired", "")
-                        if isinstance(exp_val, str) and exp_val:
-                            try:
-                                dt = datetime.fromisoformat(exp_val.replace("Z", "+00:00"))
-                                payload["expires_at"] = int(dt.timestamp())
-                            except ValueError:
-                                pass
-
-                        up_resp = requests.post(
-                            f"{SUB2API_URL.rstrip('/')}/api/v1/admin/accounts",
-                            headers=hdrs, json=payload, timeout=15,
-                        )
-                        if up_resp.status_code in (200, 201) and up_resp.json().get("code") == 0:
-                            synced_sub2api += 1
-                            missing_emails.discard(email)
-                    except Exception:
-                        pass
-
-                    if synced_sub2api >= 200:  # Cap per run
-                        break
-
-                print(f"  [Sync] Sub2API: synced {synced_sub2api}")
-
-        except Exception as e:
-            print(f"  [Sync] Sub2API sync failed: {e}")
-
-    return {"synced_cpa": total_synced_cpa, "synced_sub2api": synced_sub2api}
+    # NOTE: Sub2API cross-sync is intentionally NOT performed here.
+    #   After the free-account purge, all CPA accounts are `team`, but this function
+    #   has no cheap way to distinguish team vs free before upload. Blind uploads
+    #   would land in the wrong sub2api group (codex free instead of codex team)
+    #   and would be immediately re-deleted by the next maintenance run.
+    #
+    #   Sub2API team accounts are managed separately by the gpt-team heartbeat
+    #   (uploads from its own DB to the correct group). Free accounts, if ever
+    #   restored, should be pushed via `scripts/restore_free_accounts.py`.
+    return {"synced_cpa": total_synced_cpa, "synced_sub2api": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -849,14 +874,14 @@ def sync_validated_accounts(dry_run: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 
 def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False, base_url: str = "", token: str = "") -> dict:
-    """Probe accounts and handle errors:
-      - 401: DISABLE only (token expired, may have refresh_token)
-      - 403: DELETE (permanently forbidden)
-      - 500/502/503: SKIP (temporary server errors)
+    """Probe accounts and delete those returning permanent errors (403).
+
+    401 (token_invalidated) is now handled by cpa_warden's delete_401 path —
+    we skip it here to avoid duplicate work. 5xx is treated as transient.
 
     Safety valve: abort deletion if >MAX_DELETE_RATIO of accounts would be affected.
 
-    Returns {"probed": N, "deleted_ok": N, "deleted_fail": N, "disabled_ok": N, "names": [...]}.
+    Returns {"probed": N, "deleted_ok": N, "deleted_fail": N, "names": [...]}.
     """
     _url = (base_url or CPA_BASE_URL).rstrip("/")
     _tok = token or CPA_TOKEN
@@ -867,9 +892,9 @@ def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False
         if f.get("type", "") == "codex" and not f.get("disabled", False)
     ]
 
-    to_delete = []   # 403: permanently forbidden
-    to_disable = []  # 401: token expired
-    skipped_5xx = 0  # 500/502/503: temporary server errors
+    to_delete = []     # 403: permanently forbidden
+    skipped_5xx = 0    # 500/502/503: temporary server errors
+    skipped_401 = 0    # handled by cpa_warden delete_401 path
 
     for af in candidates:
         name = af.get("name", "")
@@ -896,46 +921,28 @@ def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False
                     upstream_status = data.get("status_code", resp.status_code)
                 except Exception:
                     pass
-            if upstream_status in DELETE_STATUSES:  # {403}
+            if upstream_status == 403:
                 to_delete.append({"name": name, "status": upstream_status})
-            elif upstream_status in DISABLE_STATUSES:  # {401}
-                to_disable.append({"name": name, "status": upstream_status})
+            elif upstream_status == 401:
+                skipped_401 += 1  # cpa_warden handles deletion
             elif upstream_status in {500, 502, 503}:
                 skipped_5xx += 1
         except Exception:
             pass
 
     print(f"    Probed {len(candidates)}: {len(to_delete)} to delete (403), "
-          f"{len(to_disable)} to disable (401), {skipped_5xx} skipped (5xx)")
+          f"{skipped_401} 401 (handled by warden), {skipped_5xx} skipped (5xx)")
 
     # Safety valve: abort DELETION if too many accounts would be deleted
     if candidates and len(to_delete) > 0 and len(to_delete) / len(candidates) > MAX_DELETE_RATIO:
         print(f"    SAFETY VALVE: {len(to_delete)}/{len(candidates)} ({len(to_delete)/len(candidates):.0%}) "
               f"deletions exceeds {MAX_DELETE_RATIO:.0%} threshold, aborting deletions")
         to_delete = []
-    # Separate safety for disables (higher threshold since 401 is common during key rotation)
-    if candidates and len(to_disable) > 0 and len(to_disable) / len(candidates) > 0.50:
-        print(f"    SAFETY VALVE: {len(to_disable)}/{len(candidates)} ({len(to_disable)/len(candidates):.0%}) "
-              f"disables exceeds 50% threshold, aborting disables")
-        to_disable = []
 
     if dry_run:
-        return {"probed": len(candidates), "deleted_ok": 0, "deleted_fail": 0,
-                "disabled_ok": 0, "names": []}
+        return {"probed": len(candidates), "deleted_ok": 0, "deleted_fail": 0, "names": []}
 
-    # Disable 401 accounts (not delete — they may recover via refresh_token)
-    disabled_ok = 0
-    for ea in to_disable:
-        try:
-            resp = requests.patch(
-                f"{_url}/v0/management/auth-files/status",
-                headers=hdrs, json={"name": ea["name"], "disabled": True}, timeout=15)
-            if resp.status_code == 200:
-                disabled_ok += 1
-        except Exception:
-            pass
-
-    # Delete only truly invalid accounts (403)
+    # Delete only truly forbidden accounts (403)
     deleted_ok, deleted_fail = 0, 0
     deleted_names = []
     for ea in to_delete:
@@ -951,7 +958,7 @@ def find_and_delete_error_accounts(auth_files: list[dict], dry_run: bool = False
             deleted_fail += 1
 
     return {"probed": len(candidates), "deleted_ok": deleted_ok, "deleted_fail": deleted_fail,
-            "disabled_ok": disabled_ok, "names": deleted_names}
+            "names": deleted_names}
 
 
 def sync_git_deletions(deleted_names: list[str], dry_run: bool = False) -> dict:
@@ -1041,14 +1048,17 @@ def send_feishu(warden_stats: dict, error_stats: dict, git_stats: dict, grok_sta
         s2a_dedup = sub2api_stats.get("dedup_deleted", 0)
         s2a_xref = sub2api_stats.get("cross_ref_deleted", 0)
         s2a_test = sub2api_stats.get("test_deleted", 0)
-        s2a_quota = sub2api_stats.get("quota_skipped", 0)
-        if s2a_del_fail > 0:
+        s2a_disable = sub2api_stats.get("quota_disabled", 0)
+        s2a_disable_fail = sub2api_stats.get("quota_disable_fail", 0)
+        s2a_reenable = sub2api_stats.get("reenabled", 0)
+        if s2a_del_fail > 0 or s2a_disable_fail > 0:
             all_ok = False
         lines.extend([
             f"━━━━━━━━━━━━━━━━━━━━",
             f"📍 Sub2API — Codex Cleanup ({SUB2API_URL})",
-            f"   📦 Total: {sub2api_stats.get('total', 0)}  |  🎯 Codex: {sub2api_stats.get('codex', 0)}",
-            f"   🔄 Dedup: {s2a_dedup}  |  🔗 Stale: {s2a_xref}  |  🚫 401: {s2a_test}  |  ⏸️ 429: {s2a_quota}",
+            f"   📦 Total: {sub2api_stats.get('total', 0)}  |  🎯 Codex free: {sub2api_stats.get('codex', 0)}",
+            f"   🔄 Dedup: {s2a_dedup}  |  🔗 Stale: {s2a_xref}  |  🚫 401: {s2a_test}",
+            f"   ⏸️ Disabled (429): ✅ {s2a_disable}  ❌ {s2a_disable_fail}  |  ▶️ Re-enabled: {s2a_reenable}",
             f"   🗑️ Deleted: ✅ {s2a_del_ok}  ❌ {s2a_del_fail}",
         ])
 
